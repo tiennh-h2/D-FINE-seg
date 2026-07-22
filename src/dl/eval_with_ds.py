@@ -5,7 +5,7 @@ import cv2
 import hydra
 import numpy as np
 from loguru import logger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -342,6 +342,8 @@ def main(cfg: DictConfig):
         cfg.exp,
         cfg.train.path_to_save,
     )
+    OmegaConf.set_struct(cfg.train, False)
+    cfg.train.disable_log = True
 
     trainer = Trainer(cfg)
 

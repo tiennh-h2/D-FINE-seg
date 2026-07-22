@@ -85,7 +85,7 @@ def log_metrics_locally(
 
     if "mIoU" in metrics_df.columns:  # sem_seg
         # metrics_list = ["mIoU", "pixel_acc"]
-        metrics_list = [ "sod_mIoU_mean", "sod_mDice_mean"]
+        metrics_list = [ "sod_mDice_mean", "sod_mIoU_mean"]
     else:
         metrics_list = [
             "mAP_50",

@@ -390,7 +390,7 @@ def run_videos_tracked(torch_model, folder_path, output_path, label_to_name, tra
         _run_video_tracked(torch_model, tracker, visualizer, video_path, out_path)
 
 
-@hydra.main(version_base=None, config_path="../../", config_name="config_size_l_1600")
+@hydra.main(version_base=None, config_path="../../", config_name="config_size_m_1600")
 def main(cfg: DictConfig):
     cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
 

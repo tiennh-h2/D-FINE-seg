@@ -26,6 +26,13 @@ train:
   bench_img_path: /home/tien.nguyen/workspace/project/D-FINE-seg/output/bench_imgs
   infer_path: /home/tien.nguyen/workspace/project/D-FINE-seg/output/infer
 
+  hgnet_v2_config:
+    use_sam2_features: True
+    # use_sam3_features: True
+    # sam_checkpoint_path: "/data1/workspace/ai_shared_workspace/model_zoo_shared/sam3/sam3.pt"
+    sam_checkpoint_path: "/data1/workspace/ai_shared_workspace/model_zoo_shared/sam2-hiera-large/sam2_hiera_large.pt"
+    train_adapter_block: True
+
   ### Configs ###
   use_wandb: False
   device: cuda

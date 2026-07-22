@@ -671,85 +671,6 @@ class SemSegValidator:
     """Streaming validator for task=sem_seg: a [C, C] pixel confusion matrix
     (rows = GT, cols = pred) accumulated at ORIGINAL image resolution — nothing
     dense is stored. GT pixels equal to ignore_index never enter the matrix.
-    """
-
-    def __init__(self, num_classes: int, label_to_name: Dict[int, str], ignore_index: int = 255):
-        self.num_classes = num_classes
-        self.label_to_name = label_to_name
-        self.ignore_index = ignore_index
-        self.cm = torch.zeros((num_classes, num_classes), dtype=torch.int64)
-
-    @torch.no_grad()
-    def update(self, pred: torch.Tensor, gt: torch.Tensor) -> None:
-        """pred/gt: (H, W) integer tensors at the same (original) resolution."""
-        valid = gt != self.ignore_index
-        if self.eval_ignore_classes:
-            ignore_gt = torch.tensor(list(self.eval_ignore_classes), device=gt.device, dtype=gt.dtype)
-            valid &= ~torch.isin(gt, ignore_gt)
-        gt_v = gt[valid].long()
-        if gt_v.numel() and int(gt_v.max()) >= self.num_classes:
-            raise ValueError(
-                f"GT mask contains class id {int(gt_v.max())} >= num_classes="
-                f"{self.num_classes} (ignore_index={self.ignore_index}); "
-                "masks must use contiguous label_to_name ids"
-            )
-        idx = gt_v * self.num_classes + pred[valid].long()
-        cm = torch.bincount(idx, minlength=self.num_classes**2)
-        self.cm += cm.reshape(self.num_classes, self.num_classes).cpu()
-
-    def compute_metrics(self, extended: bool = False) -> Dict[str, float]:
-        cm = self.cm.double()
-        diag = cm.diag()
-        union = cm.sum(1) + cm.sum(0) - diag
-        present = cm.sum(1) > 0  # classes with GT pixels
-        if self.eval_ignore_classes:
-            for c in self.eval_ignore_classes:
-                present[c] = False
-        iou = diag / union.clamp(min=1)
-        miou = iou[present].mean().item() if present.any() else 0.0
-        acc = (diag.sum() / cm.sum().clamp(min=1)).item()
-        metrics = {"mIoU": round(miou, 4), "pixel_acc": round(acc, 4)}
-        if extended:
-            metrics["extended_metrics"] = {
-                f"iou_{self.label_to_name[c]}": round(iou[c].item(), 4)
-                for c in range(self.num_classes)
-                if present[c]
-            }
-        return metrics
-
-    def save_plots(self, path_to_save) -> None:
-        """Row-normalized pixel confusion matrix."""
-        path_to_save = Path(path_to_save)
-        path_to_save.mkdir(parents=True, exist_ok=True)
-
-        cm = self.cm.double()
-        cm_norm = (cm / cm.sum(1, keepdim=True).clamp(min=1)).numpy()
-        class_labels = [str(self.label_to_name[c]) for c in range(self.num_classes)]
-
-        plt.figure(figsize=(max(8, self.num_classes * 0.5), max(6, self.num_classes * 0.45)))
-        plt.imshow(cm_norm, interpolation="nearest", cmap=plt.cm.Blues, vmin=0, vmax=1)
-        plt.title("Pixel Confusion Matrix (row-normalized)")
-        plt.colorbar()
-        tick_marks = np.arange(self.num_classes)
-        plt.xticks(tick_marks, class_labels, rotation=90)
-        plt.yticks(tick_marks, class_labels)
-        plt.ylabel("True class")
-        plt.xlabel("Predicted class")
-        plt.tight_layout()
-        plt.savefig(path_to_save / "confusion_matrix.png")
-        plt.close()
-
-
-from typing import Any, Dict, Optional, Iterable
-import numpy as np
-import torch
-import py_sod_metrics
-
-
-class SemSegValidator:
-    """Streaming validator for task=sem_seg: a [C, C] pixel confusion matrix
-    (rows = GT, cols = pred) accumulated at ORIGINAL image resolution — nothing
-    dense is stored. GT pixels equal to ignore_index never enter the matrix.
 
     In addition to the confusion matrix, maintains a per-class py_sod_metrics
     pack (IoU/Dice via FmeasureV2) computed on binarized per-class masks, so
@@ -760,15 +681,11 @@ class SemSegValidator:
         self,
         num_classes: int,
         label_to_name: Dict[int, str],
-        ignore_index: int = 255,
-        eval_ignore_classes: Optional[Iterable[int]] = None,
+        ignore_index: int = 255
     ):
         self.num_classes = num_classes
         self.label_to_name = label_to_name
         self.ignore_index = ignore_index
-        # NOTE: this was referenced but never set in the original snippet —
-        # fixing that here since update()/compute_metrics() depend on it.
-        self.eval_ignore_classes = set(eval_ignore_classes) if eval_ignore_classes else set()
         self.cm = torch.zeros((num_classes, num_classes), dtype=torch.int64)
         self.sod_packs: Dict[int, Dict[str, Any]] = {
             c: self._build_sod_metric_pack() for c in range(num_classes)
@@ -778,9 +695,6 @@ class SemSegValidator:
     def update(self, pred: torch.Tensor, gt: torch.Tensor) -> None:
         """pred/gt: (H, W) integer tensors at the same (original) resolution."""
         valid = gt != self.ignore_index
-        if self.eval_ignore_classes:
-            ignore_gt = torch.tensor(list(self.eval_ignore_classes), device=gt.device, dtype=gt.dtype)
-            valid &= ~torch.isin(gt, ignore_gt)
         gt_v = gt[valid].long()
         if gt_v.numel() and int(gt_v.max()) >= self.num_classes:
             raise ValueError(
@@ -815,8 +729,6 @@ class SemSegValidator:
         classes_present = np.unique(gt_np[valid_np]) if valid_np.any() else np.array([], dtype=gt_np.dtype)
 
         for c in range(self.num_classes):
-            if c in self.eval_ignore_classes:
-                continue
             # Skip classes absent from both gt and pred in this image — cheap
             # early-out that avoids scoring an all-zero mask pair.
             if c not in classes_present and not (pred_np == c).any():
@@ -830,9 +742,6 @@ class SemSegValidator:
         diag = cm.diag()
         union = cm.sum(1) + cm.sum(0) - diag
         present = cm.sum(1) > 0  # classes with GT pixels
-        if self.eval_ignore_classes:
-            for c in self.eval_ignore_classes:
-                present[c] = False
         iou = diag / union.clamp(min=1)
         miou = iou[present].mean().item() if present.any() else 0.0
         acc = (diag.sum() / cm.sum().clamp(min=1)).item()
@@ -841,16 +750,16 @@ class SemSegValidator:
         per_class_sod = self._compute_sod_metrics(present)
         if per_class_sod:
             metrics["sod_mIoU_adaptive"] = round(
-                float(np.mean([v["iou_adaptive"] for v in per_class_sod.values()])), 4
+                float(np.mean([v["iou_adaptive"] for c, v in per_class_sod.items() if c != 0])), 4
             )
             metrics["sod_mIoU_mean"] = round(
-                float(np.mean([v["iou_mean"] for v in per_class_sod.values()])), 4
+                float(np.mean([v["iou_mean"] for c, v in per_class_sod.items() if c != 0])), 4
             )
             metrics["sod_mDice_adaptive"] = round(
-                float(np.mean([v["dice_adaptive"] for v in per_class_sod.values()])), 4
+                float(np.mean([v["dice_adaptive"] for c, v in per_class_sod.items() if c != 0])), 4
             )
             metrics["sod_mDice_mean"] = round(
-                float(np.mean([v["dice_mean"] for v in per_class_sod.values()])), 4
+                float(np.mean([v["dice_mean"] for c, v in per_class_sod.items() if c != 0])), 4
             )
 
         if extended:
@@ -879,7 +788,7 @@ class SemSegValidator:
         """
         out: Dict[int, Dict[str, float]] = {}
         for c in range(self.num_classes):
-            if not present[c] or c in self.eval_ignore_classes:
+            if not present[c]:
                 continue
             results = self.sod_packs[c]["FMv2"].get_results()
             iou_res = results["iou"]

@@ -144,7 +144,7 @@ class Trainer:
             self.init_dirs()
 
         if self.task == "sem_seg":
-            self.decision_metrics = ["sod_mIoU_mean"]  # dense seg has no box metrics
+            self.decision_metrics = ["sod_mDice_mean"]  # dense seg has no box metrics
         elif enable_mask_head:
             for i, metric in enumerate(self.decision_metrics):
                 if metric == "mAP_50":
@@ -164,7 +164,7 @@ class Trainer:
                 self.use_wandb = False
 
         log_file = Path(cfg.train.path_to_save) / "train_log.txt"
-        if (not self.distributed) or self.is_main:
+        if ((not self.distributed) or self.is_main) and not cfg.train.get("disable_log"):
             log_file.unlink(missing_ok=True)
             logger.add(log_file, format="{message}", level="INFO", rotation="10 MB")
             logger.info(
@@ -206,6 +206,7 @@ class Trainer:
             pretrained_model_path=cfg.train.pretrained_model_path,
             pretrained_backbone=cfg.train.get("imagenet_backbone", False),
             task=self.task,
+            hgnet_v2_config=cfg.train.get("hgnet_v2_config")
         )
         if self.distributed:
             if torch.cuda.is_available():
@@ -489,7 +490,7 @@ class Trainer:
 
     @torch.no_grad()
     def evaluate_sem_seg(
-        self, val_loader: DataLoader, path_to_save: Path, extended: bool, mode: str = None
+        self, val_loader: DataLoader, path_to_save: Path, extended: bool, mode: str = None, conf_thresh: float = 0.5
     ) -> Dict[str, float]:
         """Streaming sem_seg eval: pixel confusion matrix at ORIGINAL resolution.
 
@@ -552,7 +553,7 @@ class Trainer:
 
                     max_probs, pred_full = pred_probs.max(dim=0)
                     pred_full = torch.where(
-                        max_probs > 0.5,
+                        max_probs > conf_thresh,
                         pred_full,
                         torch.zeros_like(pred_full),  # use background class 0
                     )
@@ -593,7 +594,7 @@ class Trainer:
         mode: str = None,
     ) -> Dict[str, float]:
         if self.task == "sem_seg":
-            return self.evaluate_sem_seg(val_loader, path_to_save, extended, mode)
+            return self.evaluate_sem_seg(val_loader, path_to_save, extended, mode, conf_thresh)
 
         # All ranks perform inference on their portion of the data
         local_gt, local_preds = self.get_preds_and_gt(val_loader=val_loader)
