@@ -64,6 +64,7 @@ def test_model_sem_seg(
     label_to_name: Dict[int, str],
     to_visualize: bool,
     max_vis: int = 20,
+    use_custom_seg_dataset: bool = False
 ):
     """mIoU/pixel_acc at original resolution (same protocol as training eval) + latency."""
     logger.info(f"Testing {name} model")
@@ -87,7 +88,10 @@ def test_model_sem_seg(
     n_vis = 0
     for _, _, img_paths in tqdm(test_loader, total=len(test_loader)):
         for img_path in img_paths:
-            img = read_image_hwc(data_path / "images" / img_path)
+            if use_custom_seg_dataset:
+                read_image_hwc(data_path / "images" / img_path)
+            else:
+                img = read_image_hwc(data_path / "images" / img_path)
             is_npy = Path(img_path).suffix.lower() == ".npy"
 
             if torch.cuda.is_available():
@@ -99,7 +103,10 @@ def test_model_sem_seg(
             latency.append((time.perf_counter() - t0) * 1000)
 
             pred_map = preds[0]["sem_seg"].cpu()
-            mask_path = data_path / "labels" / f"{Path(img_path).stem}.png"
+            if use_custom_seg_dataset:
+                mask_path = data_path / "labels" / f"{Path(img_path).stem}.png"
+            else:
+                mask_path = data_path / "labels" / f"{Path(img_path).stem}.png"
             gt = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             if gt is None:
                 raise FileNotFoundError(f"Can't read GT mask {mask_path}")
@@ -460,6 +467,7 @@ def main(cfg: DictConfig):
                 ignore_index=int(cfg.train.sem_seg.ignore_index),
                 label_to_name=cfg.train.label_to_name,
                 to_visualize=to_visualize,
+                use_custom_seg_dataset=cfg.train.custom_seg_dataset
             )
         else:
             all_metrics[model_name] = test_model(

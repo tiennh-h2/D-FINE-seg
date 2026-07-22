@@ -1,47 +1,43 @@
-project_name: cityscapes # for wandb
+project_name: fbm_stair_seg_20260715 # for wandb
 exp_name: det_s # experiment name
 
 exp: ${exp_name}_${now_dir}
 
-model_name: s # model size (n, s, m, l, x)
-task: detect # detect | segment (instance segmentation) | sem_seg (semantic segmentation)
+model_name: l # model size (n, s, m, l, x)
+task: sem_seg # detect | segment (instance segmentation) | sem_seg (semantic segmentation)
 
 train:
   ### Paths ###
-  root: /home/argo/Desktop/Projects/cityscapes # project root with dataset and outputs
+  root: /home/tien.nguyen/workspace/project/common/data/yap-3/wall_seg_crop/ # project root with dataset and outputs
   pretrained_dataset: coco # coco, obj2coco
   # detect: dfine_${model_name}_${train.pretrained_dataset}.pt; sem_seg/segment: use dfine_seg_*
   pretrained_model_path: pretrained/dfine_seg_${model_name}_coco.pt
 
   imagenet_backbone: False # research: init HGNetv2 from ImageNet stage1 weights
   coco_dataset: False # set True when annotations are in COCO JSON format (train/val/test)
+  custom_seg_dataset: True
 
-  data_path: ${train.root}/data/dataset # path to dataset (images/, labels/, train.csv, val.csv)
-  path_to_test_data: ${train.root}/data/test  # path to test set, used in infer script
-  path_to_save: ${train.root}/output/models/${exp} # where to save output
+  data_path: ${train.root} # path to dataset (images/, labels/, train.csv, val.csv)
+  path_to_test_data: ${train.root}/test/images  # path to test set, used in infer script
+  path_to_save: /home/tien.nguyen/workspace/project/D-FINE-seg/experiments/test # where to save output
 
-  debug_img_path: ${train.root}/output/debug_images
-  eval_preds_path: ${train.root}/output/eval_preds
-  bench_img_path: ${train.root}/output/bench_imgs
-  infer_path: ${train.root}/output/infer
+  debug_img_path: /home/tien.nguyen/workspace/project/D-FINE-seg/output/debug_images
+  eval_preds_path: /home/tien.nguyen/workspace/project/D-FINE-seg/output/eval_preds
+  bench_img_path: /home/tien.nguyen/workspace/project/D-FINE-seg/output/bench_imgs
+  infer_path: /home/tien.nguyen/workspace/project/D-FINE-seg/output/infer
 
   ### Configs ###
-  use_wandb: True
+  use_wandb: False
   device: cuda
   label_to_name: # dataset's classes
-    0: person
-    1: rider
-    2: car
-    3: truck
-    4: bus
-    5: train
-    6: motorcycle
-    7: bicycle
+    0: background
+    1: stair
 
   use_one_class: False
 
   # sem_seg only: masks live in <data_path>/labels/<stem>.png, 1 channel, pixel value = class id
   sem_seg:
+    eval_ignore_classes: [0]
     ignore_index: 255 # pixel value excluded from loss + mIoU (also used as aug mask fill)
     class_weights: null # optional per-class CE weights for imbalance
 
@@ -56,7 +52,7 @@ train:
   - mAP_50 # will be swapped with mask version for task = segment
   - iou
 
-  img_size: [640, 640] # (h, w)
+  img_size: [1600, 1600] # (h, w)
   in_channels: 3 # 3 = RGB (default). >3 expects .npy stacks (RGB+extras) — see README
   keep_ratio: False # image aspect ratio, if True - image will be padded
   to_visualize_eval: True # save images with gt and preds
@@ -66,7 +62,7 @@ train:
   amp_dtype: bfloat16 # bfloat16/float16
   clip_max_norm: 0.1 # gradient clipping
 
-  batch_size: -1 # physical, should fit on the device. In DDP used per GPU. Auto-pick with -1
+  batch_size: 2 # physical, should fit on the device. In DDP used per GPU. Auto-pick with -1
   b_accum_steps: 1 # grad accumulation (n * bs)
   epochs: 75
   max_walltime_min: null # research: stop training after N minutes (best epoch kept); null = no cap

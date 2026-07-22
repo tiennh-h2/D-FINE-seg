@@ -40,7 +40,7 @@ base_cfg = {
         "reg_max": 32,
     },
     "SemSegCriterion": {
-        "weight_dict": {"loss_ce": 1, "loss_dice": 1, "loss_aux": 0.4},
+        "weight_dict": {"loss_ce": 1, "loss_dice": 1, "loss_aux": 0.4, "loss_structure": 0},
     },
     "matcher": {
         "weight_dict": {
@@ -121,6 +121,11 @@ sizes_cfg = {
             "freeze_at": -1,
             "freeze_norm": False,
             "use_lab": True,
+            # "use_sam2_features": True,
+            "use_sam3_features": True,
+            "sam_checkpoint_path": "/data1/workspace/ai_shared_workspace/model_zoo_shared/sam3/sam3.pt",
+            # "sam_checkpoint_path": "/data1/workspace/ai_shared_workspace/model_zoo_shared/sam2-hiera-large/sam2_hiera_large.pt",
+            "train_adapter_block": True
         },
         "HybridEncoder": {
             "in_channels": [384, 768, 1536],
@@ -151,6 +156,11 @@ sizes_cfg = {
             "freeze_at": 0,
             "freeze_norm": True,
             "use_lab": False,
+            # "use_sam2_features": True,
+            "use_sam3_features": False,
+            "sam_checkpoint_path": "/data1/workspace/ai_shared_workspace/model_zoo_shared/sam3/sam3.pt",
+            # "sam_checkpoint_path": "/data1/workspace/ai_shared_workspace/model_zoo_shared/sam2-hiera-large/sam2_hiera_large.pt",
+            "train_adapter_block": True
         },
         "HybridEncoder": {
             "in_channels": [512, 1024, 2048],

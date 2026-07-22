@@ -157,36 +157,103 @@ class Torch_model:
             return [out[0]]
         return out
 
-    @staticmethod
+    # @staticmethod
+    # def process_sem_seg(
+    #     logits,  # [B, C, H, W] at input resolution
+    #     processed_sizes,
+    #     original_sizes,
+    #     keep_ratio: bool,
+    #     labels_to_use: List[int] = None,  # empty -> keep all; else ids not requested -> 255
+    # ) -> List[Dict[str, torch.Tensor]]:
+    #     """argmax -> per-image NEAREST resize to original size (letterbox pads cropped first).
+
+    #     Returns list of length B with {"sem_seg": uint8 [H0, W0] label map}.
+    #     """
+    #     maps = logits.argmax(1, keepdim=True).float()  # [B, 1, H, W]
+    #     if labels_to_use:  # ids not requested -> 255 (ignore/void, not class 0)
+    #         lbl_set = torch.as_tensor(labels_to_use, device=maps.device, dtype=maps.dtype)
+    #         maps = torch.where(torch.isin(maps, lbl_set), maps, 255.0)
+    #     results = []
+    #     for b in range(maps.shape[0]):
+    #         m = maps[b : b + 1]
+    #         H0, W0 = int(original_sizes[b][0]), int(original_sizes[b][1])
+    #         if keep_ratio:
+    #             proc_h, proc_w = int(processed_sizes[b][0]), int(processed_sizes[b][1])
+    #             gain = min(proc_h / H0, proc_w / W0)
+    #             padw = round((proc_w - W0 * gain) / 2 - 0.1)
+    #             padh = round((proc_h - H0 * gain) / 2 - 0.1)
+    #             m = m[
+    #                 ..., max(padh, 0) : proc_h - max(padh, 0), max(padw, 0) : proc_w - max(padw, 0)
+    #             ]
+    #         m = torch.nn.functional.interpolate(m, size=(H0, W0), mode="nearest")[0, 0]
+    #         results.append({"sem_seg": m.to(torch.uint8)})
+    #     return results
+
     def process_sem_seg(
-        logits,  # [B, C, H, W] at input resolution
+        self,
+        logits: torch.Tensor,
         processed_sizes,
         original_sizes,
         keep_ratio: bool,
-        labels_to_use: List[int] = None,  # empty -> keep all; else ids not requested -> 255
+        labels_to_use: List[int] | None = None,
     ) -> List[Dict[str, torch.Tensor]]:
-        """argmax -> per-image NEAREST resize to original size (letterbox pads cropped first).
+        """Convert logits [B, C, H, W] into semantic label maps at original resolution."""
 
-        Returns list of length B with {"sem_seg": uint8 [H0, W0] label map}.
-        """
-        maps = logits.argmax(1, keepdim=True).float()  # [B, 1, H, W]
-        if labels_to_use:  # ids not requested -> 255 (ignore/void, not class 0)
-            lbl_set = torch.as_tensor(labels_to_use, device=maps.device, dtype=maps.dtype)
-            maps = torch.where(torch.isin(maps, lbl_set), maps, 255.0)
+        if logits.ndim != 4:
+            raise ValueError(
+                f"logits must have shape [B, C, H, W], got {tuple(logits.shape)}"
+            )
+
+        logits = logits.detach().float()
+
         results = []
-        for b in range(maps.shape[0]):
-            m = maps[b : b + 1]
-            H0, W0 = int(original_sizes[b][0]), int(original_sizes[b][1])
+
+        for b in range(logits.shape[0]):
+            pred = logits[b : b + 1]
+
+            H0, W0 = map(int, original_sizes[b])
+
             if keep_ratio:
-                proc_h, proc_w = int(processed_sizes[b][0]), int(processed_sizes[b][1])
+                proc_h, proc_w = map(int, processed_sizes[b])
+
                 gain = min(proc_h / H0, proc_w / W0)
                 padw = round((proc_w - W0 * gain) / 2 - 0.1)
                 padh = round((proc_h - H0 * gain) / 2 - 0.1)
-                m = m[
-                    ..., max(padh, 0) : proc_h - max(padh, 0), max(padw, 0) : proc_w - max(padw, 0)
+
+                pred = pred[
+                    :,
+                    :,
+                    max(padh, 0) : proc_h - max(padh, 0),
+                    max(padw, 0) : proc_w - max(padw, 0),
                 ]
-            m = torch.nn.functional.interpolate(m, size=(H0, W0), mode="nearest")[0, 0]
-            results.append({"sem_seg": m.to(torch.uint8)})
+
+            pred_probs = torch.softmax(pred, dim=1)   # (1, C, h', w')
+
+            if pred_probs.shape[-2:] != (H0, W0):
+                pred_probs = torch.nn.functional.interpolate(
+                    pred_probs,
+                    size=(H0, W0),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+            foreground_prob = pred_probs[0, 1]  # (H0, W0)
+            sem_seg = (foreground_prob > self.mask_threshold).long()
+
+            if labels_to_use:
+                keep = torch.as_tensor(
+                    labels_to_use,
+                    device=sem_seg.device,
+                    dtype=sem_seg.dtype,
+                )
+                sem_seg = torch.where(
+                    torch.isin(sem_seg, keep),
+                    sem_seg,
+                    torch.full_like(sem_seg, 255),
+                )
+
+            results.append({"sem_seg": sem_seg.to(torch.uint8)})
+
         return results
 
     def _preds_postprocess(
@@ -319,8 +386,25 @@ class Torch_model:
         original_sizes = []
         processed_sizes = []
 
+        import albumentations as A
+        from albumentations.pytorch import ToTensorV2
+        resize = [A.Resize(1600, 1600, interpolation=cv2.INTER_LINEAR)]
+        norm = [
+            A.Normalize(mean=[0.0,0.0,0.0], std=[1.0,1.0,1.0]),
+            ToTensorV2(),
+        ]
+        val_transform = A.Compose(
+            resize + norm,
+            mask_interpolation=cv2.INTER_LINEAR,
+        )
+
         if isinstance(inputs, np.ndarray) and inputs.ndim == 3:  # single image
-            processed_inputs = self._preprocess(inputs, bgr=bgr)[None]
+            # processed_inputs = self._preprocess(inputs, bgr=bgr)[None]
+            if bgr:
+                inputs = cv2.cvtColor(inputs, cv2.COLOR_BGR2RGB)
+            processed_inputs = val_transform(image=inputs)['image']
+            if processed_inputs.ndim == 3:
+                processed_inputs = processed_inputs.unsqueeze(0)
             original_sizes.append((inputs.shape[0], inputs.shape[1]))
             processed_sizes.append((processed_inputs[0].shape[1], processed_inputs[0].shape[2]))
 
@@ -338,8 +422,9 @@ class Torch_model:
 
         # Transfer to device and normalize there (faster for GPU)
         if self.device == "cuda":
-            tensor = torch.from_numpy(processed_inputs).to(self.device, non_blocking=True)
-            tensor = tensor.to(dtype=torch.float32).div_(255.0)
+            # tensor = torch.from_numpy(processed_inputs).to(self.device, non_blocking=True)
+            # tensor = tensor.to(dtype=torch.float32).div_(255.0)
+            tensor = processed_inputs.to(self.device, non_blocking=True)
         else:
             tensor = (
                 torch.from_numpy(processed_inputs)

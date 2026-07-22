@@ -15,6 +15,7 @@ configs/
 wandb/
 output/
 weight/
+experiments/
 
 # Research harness: keep ledger/notebook/ideas, ignore bulky per-run artifacts
 experiments/runs/

@@ -23,6 +23,39 @@ ones_ = nn.init.ones_
 __all__ = ["HGNetv2"]
 
 
+from sam3.model.vitdet import ViT
+
+
+def _create_vit_backbone():
+    """Create ViT backbone for visual feature extraction."""
+    return ViT(
+        img_size=1008,
+        pretrain_img_size=336,
+        patch_size=14,
+        embed_dim=1024,
+        depth=32,
+        num_heads=16,
+        mlp_ratio=4.625,
+        norm_layer="LayerNorm",
+        drop_path_rate=0.1,
+        qkv_bias=True,
+        use_abs_pos=True,
+        tile_abs_pos=True,
+        global_att_blocks=(7, 15, 23, 31),
+        rel_pos_blocks=(),
+        use_rope=True,
+        use_interp_rope=True,
+        window_size=24,
+        pretrain_use_cls_token=True,
+        retain_cls_token=False,
+        ln_pre=True,
+        ln_post=False,
+        return_interm_layers=False,
+        bias_patch_embed=False,
+        # compile_mode=compile_mode,
+        compile_mode=None,
+    )
+
 class LearnableAffineBlock(nn.Module):
     def __init__(self, scale_value=1.0, bias_value=0.0):
         super().__init__()
@@ -330,6 +363,25 @@ class HG_Stage(nn.Module):
         return x
 
 
+class Adapter(nn.Module):
+    def __init__(self, blk) -> None:
+        super(Adapter, self).__init__()
+        self.block = blk
+        dim = blk.attn.qkv.in_features
+        self.prompt_learn = nn.Sequential(
+            nn.Linear(dim, 32),
+            nn.GELU(),
+            nn.Linear(32, dim),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        prompt = self.prompt_learn(x)
+        promped = x + prompt
+        net = self.block(promped)
+        return net
+
+
 class HGNetv2(nn.Module):
     """
     HGNetV2
@@ -433,6 +485,11 @@ class HGNetv2(nn.Module):
         pretrained=True,
         local_model_dir="weight/hgnetv2/",
         in_channels: int = 3,
+        use_sam2_features: bool = False,
+        use_sam3_features: bool = False,
+        sam_checkpoint_path: str | None = None,
+        fuse_sam: bool = True,
+        train_adapter_block: bool = False
     ):
         super().__init__()
         self.use_lab = use_lab
@@ -549,6 +606,79 @@ class HGNetv2(nn.Module):
                         + RESET
                     )
                 exit()
+        
+        self.use_sam3_features = use_sam3_features
+        self.use_sam2_features = use_sam2_features
+        if self.use_sam2_features or self.use_sam3_features:
+            assert sam_checkpoint_path is not None, "'sam_checkpoint_path' must be provided"
+
+            ckpt = torch.load(sam_checkpoint_path, map_location="cpu")
+            if "model" in ckpt:
+                ckpt = ckpt["model"]
+            
+            if self.use_sam2_features:
+                from sam2.modeling.backbones.hieradet import Hiera
+                self.sam_encoder = Hiera(
+                    embed_dim=144,
+                    num_heads=2,
+                    stages=[2, 6, 36, 4],
+                    global_att_blocks=[23, 33, 43],
+                    window_pos_embed_bkg_spatial_size=[7, 7],
+                    window_spec=[8, 4, 16, 8],
+                )
+
+                state_dict = {}
+                for k, v in ckpt.items():
+                    if k.startswith("image_encoder.trunk."):
+                        state_dict[k[len("image_encoder.trunk."):]] = v
+
+                self.sam_encoder.load_state_dict(state_dict)
+
+            elif self.use_sam3_features:
+                self.sam_encoder = _create_vit_backbone()
+                new_ckpt = dict()
+                for k, v in ckpt.items():
+                    if "detector.backbone.vision_backbone.trunk." in k:
+                        new_ckpt[k[len("detector.backbone.vision_backbone.trunk.") :]] = v
+                
+                self.sam_encoder.load_state_dict(new_ckpt)
+
+            for p in self.sam_encoder.parameters():
+                p.requires_grad_(False)
+
+            if train_adapter_block:
+                for param in self.sam_encoder.parameters():
+                    param.requires_grad = False
+
+                blocks = []
+                for block in self.sam_encoder.blocks:
+                    blocks.append(Adapter(block))
+                    
+                self.sam_encoder.blocks = nn.Sequential(*blocks)
+
+            self.fuse_sam = fuse_sam
+
+            self.sam_return_idx = list(self.return_idx)
+            all_sam_channels = [144, 288, 576, 1152]
+
+            self.sam_channels = [
+                all_sam_channels[i]
+                for i in self.sam_return_idx
+            ]
+
+            hg_channels = [
+                self._out_channels[i]
+                for i in self.return_idx
+            ]
+
+            if self.use_sam3_features:
+                self.reduce1 = nn.Conv2d(1024, hg_channels[0], 1)
+                self.reduce2 = nn.Conv2d(1024, hg_channels[1], 1)
+                self.reduce3 = nn.Conv2d(1024, hg_channels[2], 1)
+            else:
+                self.sam_proj = nn.ModuleList([ 
+                    nn.Conv2d(sam_c, hg_c, kernel_size=1) for sam_c, hg_c in zip(self.sam_channels, hg_channels) 
+                ])
 
     def _freeze_norm(self, m: nn.Module):
         if isinstance(m, nn.BatchNorm2d):
@@ -565,10 +695,69 @@ class HGNetv2(nn.Module):
             p.requires_grad = False
 
     def forward(self, x):
+        image = x
         x = self.stem(x)
-        outs = []
+        hg_outs = []
         for idx, stage in enumerate(self.stages):
             x = stage(x)
             if idx in self.return_idx:
-                outs.append(x)
+                hg_outs.append(x)
+
+        if not self.use_sam2_features and not self.use_sam3_features:
+            return hg_outs
+        
+        if self.use_sam3_features:
+            image = F.interpolate(image, size=(1008, 1008), mode="bilinear")
+
+        sam_outs = self.sam_encoder(image)
+
+        if self.use_sam3_features:
+            sam_out = sam_outs[-1]
+            x1 = F.interpolate(
+                self.reduce1(sam_out),
+                size=hg_outs[0].shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+            x2 = F.interpolate(
+                self.reduce2(sam_out),
+                size=hg_outs[1].shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+            x3 = F.interpolate(
+                self.reduce3(sam_out),
+                size=hg_outs[2].shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            outs = [x1 + hg_outs[0], x2 + hg_outs[1], x3 + hg_outs[2]]
+        else:
+            # Select SAM feature levels matching HGNet return_idx.
+            sam_outs = [
+                sam_outs[i]
+                for i in self.sam_return_idx
+            ]
+
+            if self.fuse_sam:
+                sam_outs = [
+                    proj(feat)
+                    for proj, feat in zip(self.sam_proj, sam_outs)
+                ]
+
+                outs = []
+
+                for h, s in zip(hg_outs, sam_outs):
+                    if h.shape[-2:] != s.shape[-2:]:
+                        s = F.interpolate(
+                            s,
+                            size=h.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+
+                    outs.append(h + s)
+
         return outs

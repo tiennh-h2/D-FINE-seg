@@ -101,6 +101,7 @@ class Trainer:
             self.local_rank = 0
             self.device = torch.device(cfg.train.device)
 
+        self.custom_seg_dataset = cfg.train.custom_seg_dataset
         self.conf_thresh = cfg.train.conf_thresh
         self.iou_thresh = cfg.train.iou_thresh
         self.epochs = cfg.train.epochs
@@ -143,7 +144,7 @@ class Trainer:
             self.init_dirs()
 
         if self.task == "sem_seg":
-            self.decision_metrics = ["mIoU"]  # dense seg has no box metrics
+            self.decision_metrics = ["sod_mIoU_mean"]  # dense seg has no box metrics
         elif enable_mask_head:
             for i, metric in enumerate(self.decision_metrics):
                 if metric == "mAP_50":
@@ -516,14 +517,17 @@ class Trainer:
                         outputs = model(inputs)
                 else:
                     outputs = model(inputs)
-                preds = outputs["sem_seg_logits"].argmax(1)  # (B, h, w) at input res
+                preds = outputs["sem_seg_logits"] # .argmax(1)  # (B, h, w) at input res
                 proc_h, proc_w = preds.shape[1], preds.shape[2]
 
                 for b, img_path in enumerate(img_paths):
-                    mask_path = labels_dir / f"{Path(img_path).stem}.png"
+                    mask_path = str(img_path).replace("/images/", "/masks/") if self.custom_seg_dataset else labels_dir / f"{Path(img_path).stem}.png"
                     gt = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
                     if gt is None:
                         raise FileNotFoundError(f"Can't read GT mask {mask_path}")
+                    if self.custom_seg_dataset:
+                        # gt = 255 - gt
+                        gt //= 255
                     gt_t = torch.from_numpy(gt).to(self.device)
                     H0, W0 = gt_t.shape
                     pred = preds[b]  # (h, w) at input res
@@ -537,9 +541,21 @@ class Trainer:
                             max(padh, 0) : proc_h - max(padh, 0),
                             max(padw, 0) : proc_w - max(padw, 0),
                         ]
-                    pred_full = F.interpolate(
-                        pred[None, None].float(), size=gt_t.shape, mode="nearest"
-                    )[0, 0].long()
+                    pred_probs = torch.softmax(pred, dim=0)      # (C, h', w')
+
+                    pred_probs = F.interpolate(
+                        pred_probs.unsqueeze(0),                 # -> (1, C, h', w')
+                        size=gt_t.shape,                         # (H0, W0)
+                        mode="bilinear",
+                        align_corners=False,
+                    )[0]                                          # -> (C, H0, W0)
+
+                    max_probs, pred_full = pred_probs.max(dim=0)
+                    pred_full = torch.where(
+                        max_probs > 0.5,
+                        pred_full,
+                        torch.zeros_like(pred_full),  # use background class 0
+                    )
                     validator.update(pred_full, gt_t)
 
                     if self.is_main and self.to_visualize_eval and n_vis < 20:
@@ -623,7 +639,7 @@ class Trainer:
             synchronize()
         return metrics
 
-    def save_model(self, metrics, best_metric):
+    def save_model(self, metrics, best_metric, epoch, cur_iter, ema_iter):
         model_to_save = self.model
         if self.ema_model:
             model_to_save = self.ema_model.model
@@ -632,7 +648,27 @@ class Trainer:
             model_to_save = model_to_save.module
 
         self.path_to_save.mkdir(parents=True, exist_ok=True)
-        torch.save(model_to_save.state_dict(), self.path_to_save / "last.pt")
+        ckpt = {
+            "epoch": epoch,
+            "cur_iter": cur_iter,
+            "best_metric": best_metric,
+            "early_stopping_steps": self.early_stopping_steps,
+
+            "model": model_to_save.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+
+            "scheduler": self.scheduler.state_dict()
+                if self.scheduler else None,
+
+            "scaler": self.scaler.state_dict()
+                if self.amp_enabled else None,
+
+            "ema": self.ema_model.model.state_dict()
+                if self.ema_model else None,
+
+            "ema_iter": ema_iter,
+        }
+        torch.save(ckpt, self.path_to_save / "last.pt")
 
         # mean from chosen metrics
         decision_metric = np.mean(
@@ -657,8 +693,74 @@ class Trainer:
         best_metric = 0
         cur_iter = 0
         ema_iter = 0
+        start_epoch = 1
         self.early_stopping_steps = 0
         one_epoch_time = None
+
+        if (self.path_to_save / "last.pt").exists():
+            ckpt = torch.load(self.path_to_save / "last.pt", map_location="cpu", weights_only=False)
+            if "model" in ckpt:
+                self.model.load_state_dict(ckpt["model"])
+                self.optimizer.load_state_dict(ckpt["optimizer"])
+
+                if self.scheduler and ckpt["scheduler"] is not None:
+                    self.scheduler.load_state_dict(ckpt["scheduler"])
+
+                if self.scaler and ckpt["scaler"] is not None:
+                    self.scaler.load_state_dict(ckpt["scaler"])
+
+                if self.ema_model and ckpt["ema"] is not None:
+                    self.ema_model.model.load_state_dict(ckpt["ema"])
+
+                start_epoch = ckpt["epoch"] + 1
+                cur_iter = ckpt["cur_iter"]
+                best_metric = ckpt["best_metric"]
+                self.early_stopping_steps = ckpt["early_stopping_steps"]
+                ema_iter = ckpt["ema_iter"]
+
+            best_model_path = self.path_to_save / "model.pt"
+            if best_model_path.exists():
+                # `best_metric` above is just whatever scalar last.pt happened to store.
+                # Recompute it by actually evaluating the saved best weights, so a stale
+                # value can't silently gate (or wrongly unlock) future "new best" saves.
+                best_state = torch.load(best_model_path, map_location="cpu", weights_only=True)
+
+                eval_holder = self.ema_model.model if self.ema_model else self.model
+                eval_target = eval_holder.module if isinstance(eval_holder, DDP) else eval_holder
+                backup_state = deepcopy(eval_target.state_dict())
+                eval_target.load_state_dict(best_state, strict=False)
+
+                if self.is_main:
+                    logger.info("Evaluating saved best model.pt to recompute best_metric...")
+                recomputed_metrics = self.evaluate(
+                    val_loader=self.val_loader,
+                    conf_thresh=self.conf_thresh,
+                    iou_thresh=self.iou_thresh,
+                    extended=False,
+                    path_to_save=None,
+                )
+
+                # restore the resumed training weights so training continues from
+                # last.pt's state, not from the best-model snapshot we just evaluated
+                eval_target.load_state_dict(backup_state)
+                del backup_state
+                gc.collect()
+
+                if self.is_main and recomputed_metrics is not None:
+                    recomputed_best = float(
+                        np.mean(
+                            [
+                                recomputed_metrics[m]
+                                for m in self.decision_metrics
+                                if m in recomputed_metrics
+                            ]
+                        )
+                    )
+                    logger.info(
+                        f"best_metric from last.pt={best_metric:.4f}, "
+                        f"recomputed from model.pt={recomputed_best:.4f}"
+                    )
+                    best_metric = recomputed_best
 
         def optimizer_step(step_scheduler: bool):
             """
@@ -699,7 +801,7 @@ class Trainer:
             for g, synced in zip(grads, _unflatten_dense_tensors(flat, grads)):
                 g.copy_(synced)
 
-        for epoch in range(1, self.epochs + 1):
+        for epoch in range(start_epoch, self.epochs + 1):
             if self.distributed and self.train_sampler is not None:
                 self.train_sampler.set_epoch(epoch)
 
@@ -772,7 +874,7 @@ class Trainer:
                         ),
                         vram=f"{get_vram_usage()}%",
                     )
-
+                
             # Final update for leftover grads from an incomplete accumulation step.
             # has_grads guards an all-None trailing window (grads None post zero_grad).
             has_grads = any(p.grad is not None for p in self.model.parameters())
@@ -795,7 +897,7 @@ class Trainer:
 
             # Only rank 0 saves and logs
             if self.is_main:
-                best_metric = self.save_model(metrics, best_metric)
+                best_metric = self.save_model(metrics, best_metric, epoch, cur_iter, ema_iter)
                 save_metrics(
                     {},
                     metrics,
@@ -847,7 +949,7 @@ class Trainer:
                 break
 
 
-@hydra.main(version_base=None, config_path="../../", config_name="config")
+@hydra.main(version_base=None, config_path="../../", config_name="config_size_m_1600")
 def main(cfg: DictConfig) -> None:
     ddp_enabled = hasattr(cfg.train, "ddp") and cfg.train.ddp.enabled
     if ddp_enabled:
@@ -883,9 +985,12 @@ def main(cfg: DictConfig) -> None:
                 in_channels=cfg.train.in_channels,
                 task=cfg.task,
             )
-            model.load_state_dict(
-                torch.load(Path(cfg.train.path_to_save) / "model.pt", weights_only=True)
+            state_dict = torch.load(
+                Path(cfg.train.path_to_save) / "model.pt",
+                weights_only=True,
             )
+            # Use strict=False to bypass loading sam2 weights
+            model.load_state_dict(state_dict, strict=False)
             if trainer.ema_model:
                 trainer.ema_model.model = model
             else:

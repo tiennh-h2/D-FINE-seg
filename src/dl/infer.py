@@ -156,7 +156,7 @@ def run_images(
             f.write(f"{label_to_name[int(class_id)]}\n")
 
 
-def run_images_sem_seg(torch_model, folder_path, output_path, label_to_name):
+def run_images_sem_seg(torch_model, folder_path, output_path, label_to_name, use_custom_seg_dataset:bool=False):
     """Overlay + raw label-map PNG per image; crops/YOLO txt are box-based -> skipped."""
     palette = sem_seg_palette(len(label_to_name))
     (output_path / "images").mkdir(parents=True, exist_ok=True)
@@ -174,12 +174,27 @@ def run_images_sem_seg(torch_model, folder_path, output_path, label_to_name):
         vis_img = img[:, :, :3] if img.shape[2] > 3 else img
         if is_npy:
             vis_img = np.ascontiguousarray(vis_img[..., ::-1])
+        
         cv2.imwrite(
             str(output_path / "images" / f"{Path(img_path).stem}.jpg"),
-            overlay_sem_seg(vis_img, label_map, palette),
+            overlay_sem_seg(
+                vis_img,
+                label_map,
+                palette,
+                binary_overlay=use_custom_seg_dataset,
+            ),
         )
         # GT-style output: grayscale PNG, pixel value = class id
-        cv2.imwrite(str(output_path / "labels" / f"{Path(img_path).stem}.png"), label_map)
+        save_label = (
+            (label_map * 255).astype(np.uint8)
+            if use_custom_seg_dataset
+            else label_map.astype(np.uint8)
+        )
+
+        cv2.imwrite(
+            str(output_path / "labels" / f"{Path(img_path).stem}.png"),
+            save_label,
+        )
         labels.update(np.unique(label_map).tolist())
 
     with open(output_path / "labels.txt", "w") as f:
@@ -375,7 +390,7 @@ def run_videos_tracked(torch_model, folder_path, output_path, label_to_name, tra
         _run_video_tracked(torch_model, tracker, visualizer, video_path, out_path)
 
 
-@hydra.main(version_base=None, config_path="../../", config_name="config")
+@hydra.main(version_base=None, config_path="../../", config_name="config_size_l_1600")
 def main(cfg: DictConfig):
     cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
 
@@ -433,7 +448,7 @@ def main(cfg: DictConfig):
     if data_type == "image":
         if cfg.task == "sem_seg":
             run_images_sem_seg(
-                torch_model, folder_path, output_path, label_to_name=cfg.train.label_to_name
+                torch_model, folder_path, output_path, label_to_name=cfg.train.label_to_name, use_custom_seg_dataset=cfg.train.custom_seg_dataset
             )
         else:
             run_images(

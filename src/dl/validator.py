@@ -3,14 +3,16 @@ import gc
 import logging
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, Iterable, List
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from loguru import logger
+import py_sod_metrics
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from torchvision.ops import box_iou
+import torch.nn.functional as F
 
 from src.dl.utils import filter_preds, rle_to_masks
 
@@ -681,6 +683,9 @@ class SemSegValidator:
     def update(self, pred: torch.Tensor, gt: torch.Tensor) -> None:
         """pred/gt: (H, W) integer tensors at the same (original) resolution."""
         valid = gt != self.ignore_index
+        if self.eval_ignore_classes:
+            ignore_gt = torch.tensor(list(self.eval_ignore_classes), device=gt.device, dtype=gt.dtype)
+            valid &= ~torch.isin(gt, ignore_gt)
         gt_v = gt[valid].long()
         if gt_v.numel() and int(gt_v.max()) >= self.num_classes:
             raise ValueError(
@@ -697,6 +702,9 @@ class SemSegValidator:
         diag = cm.diag()
         union = cm.sum(1) + cm.sum(0) - diag
         present = cm.sum(1) > 0  # classes with GT pixels
+        if self.eval_ignore_classes:
+            for c in self.eval_ignore_classes:
+                present[c] = False
         iou = diag / union.clamp(min=1)
         miou = iou[present].mean().item() if present.any() else 0.0
         acc = (diag.sum() / cm.sum().clamp(min=1)).item()
@@ -730,6 +738,206 @@ class SemSegValidator:
         plt.tight_layout()
         plt.savefig(path_to_save / "confusion_matrix.png")
         plt.close()
+
+
+from typing import Any, Dict, Optional, Iterable
+import numpy as np
+import torch
+import py_sod_metrics
+
+
+class SemSegValidator:
+    """Streaming validator for task=sem_seg: a [C, C] pixel confusion matrix
+    (rows = GT, cols = pred) accumulated at ORIGINAL image resolution — nothing
+    dense is stored. GT pixels equal to ignore_index never enter the matrix.
+
+    In addition to the confusion matrix, maintains a per-class py_sod_metrics
+    pack (IoU/Dice via FmeasureV2) computed on binarized per-class masks, so
+    you get SOD-style adaptive/mean scores alongside standard mIoU.
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        label_to_name: Dict[int, str],
+        ignore_index: int = 255,
+        eval_ignore_classes: Optional[Iterable[int]] = None,
+    ):
+        self.num_classes = num_classes
+        self.label_to_name = label_to_name
+        self.ignore_index = ignore_index
+        # NOTE: this was referenced but never set in the original snippet —
+        # fixing that here since update()/compute_metrics() depend on it.
+        self.eval_ignore_classes = set(eval_ignore_classes) if eval_ignore_classes else set()
+        self.cm = torch.zeros((num_classes, num_classes), dtype=torch.int64)
+        self.sod_packs: Dict[int, Dict[str, Any]] = {
+            c: self._build_sod_metric_pack() for c in range(num_classes)
+        }
+
+    @torch.no_grad()
+    def update(self, pred: torch.Tensor, gt: torch.Tensor) -> None:
+        """pred/gt: (H, W) integer tensors at the same (original) resolution."""
+        valid = gt != self.ignore_index
+        if self.eval_ignore_classes:
+            ignore_gt = torch.tensor(list(self.eval_ignore_classes), device=gt.device, dtype=gt.dtype)
+            valid &= ~torch.isin(gt, ignore_gt)
+        gt_v = gt[valid].long()
+        if gt_v.numel() and int(gt_v.max()) >= self.num_classes:
+            raise ValueError(
+                f"GT mask contains class id {int(gt_v.max())} >= num_classes="
+                f"{self.num_classes} (ignore_index={self.ignore_index}); "
+                "masks must use contiguous label_to_name ids"
+            )
+        idx = gt_v * self.num_classes + pred[valid].long()
+        cm = torch.bincount(idx, minlength=self.num_classes**2)
+        self.cm += cm.reshape(self.num_classes, self.num_classes).cpu()
+
+        self._update_sod_packs(pred, gt, valid)
+
+    def _update_sod_packs(self, pred: torch.Tensor, gt: torch.Tensor, valid: torch.Tensor) -> None:
+        """Feed each present class's py_sod_metrics pack a binary (0/255)
+        pred/gt mask for this image.
+
+        Caveats (deliberate simplifications, revisit if they matter to you):
+        - Ignored pixels are zeroed out in BOTH pred_c and gt_c before scoring,
+          so they contribute as matched background rather than being excluded
+          outright. py_sod_metrics operates on dense arrays and has no notion
+          of a per-pixel ignore mask, so this is an approximation.
+        - This loops over all num_classes per image (O(C) mask builds +
+          C metric steps). Fine for moderate C (a few hundred); for very large
+          C you may want to only step classes present in gt_c OR pred_c to cut
+          wasted work on all-background masks.
+        """
+        gt_np = gt.cpu().numpy()
+        pred_np = pred.cpu().numpy()
+        valid_np = valid.cpu().numpy()
+
+        classes_present = np.unique(gt_np[valid_np]) if valid_np.any() else np.array([], dtype=gt_np.dtype)
+
+        for c in range(self.num_classes):
+            if c in self.eval_ignore_classes:
+                continue
+            # Skip classes absent from both gt and pred in this image — cheap
+            # early-out that avoids scoring an all-zero mask pair.
+            if c not in classes_present and not (pred_np == c).any():
+                continue
+            gt_c = (((gt_np == c) & valid_np).astype(np.uint8) * 255)
+            pred_c = (((pred_np == c) & valid_np).astype(np.uint8) * 255)
+            self.sod_packs[c]["FMv2"].step(pred=pred_c, gt=gt_c)
+
+    def compute_metrics(self, extended: bool = False) -> Dict[str, float]:
+        cm = self.cm.double()
+        diag = cm.diag()
+        union = cm.sum(1) + cm.sum(0) - diag
+        present = cm.sum(1) > 0  # classes with GT pixels
+        if self.eval_ignore_classes:
+            for c in self.eval_ignore_classes:
+                present[c] = False
+        iou = diag / union.clamp(min=1)
+        miou = iou[present].mean().item() if present.any() else 0.0
+        acc = (diag.sum() / cm.sum().clamp(min=1)).item()
+        metrics = {"mIoU": round(miou, 4), "pixel_acc": round(acc, 4)}
+
+        per_class_sod = self._compute_sod_metrics(present)
+        if per_class_sod:
+            metrics["sod_mIoU_adaptive"] = round(
+                float(np.mean([v["iou_adaptive"] for v in per_class_sod.values()])), 4
+            )
+            metrics["sod_mIoU_mean"] = round(
+                float(np.mean([v["iou_mean"] for v in per_class_sod.values()])), 4
+            )
+            metrics["sod_mDice_adaptive"] = round(
+                float(np.mean([v["dice_adaptive"] for v in per_class_sod.values()])), 4
+            )
+            metrics["sod_mDice_mean"] = round(
+                float(np.mean([v["dice_mean"] for v in per_class_sod.values()])), 4
+            )
+
+        if extended:
+            extended_metrics = {
+                f"iou_{self.label_to_name[c]}": round(iou[c].item(), 4)
+                for c in range(self.num_classes)
+                if present[c]
+            }
+            for c, v in per_class_sod.items():
+                name = self.label_to_name[c]
+                extended_metrics[f"sod_iou_{name}"] = v["iou_mean"]
+                extended_metrics[f"sod_dice_{name}"] = v["dice_mean"]
+            metrics["extended_metrics"] = extended_metrics
+
+        return metrics
+
+    def _compute_sod_metrics(self, present: torch.Tensor) -> Dict[int, Dict[str, float]]:
+        """Pull adaptive/mean IoU & Dice out of each class's FmeasureV2 pack.
+
+        ASSUMPTION TO VERIFY: get_results() key layout below matches
+        py_sod_metrics's FmeasureV2 output shape for IOUHandler/DICEHandler
+        with with_adaptive=True, with_dynamic=True — i.e. a dict of
+        {"iou": {"adaptive": float, "dynamic": np.ndarray}, "dice": {...}}.
+        Print results.keys() / results once against your installed version
+        if this errors, and adjust the two lookups below accordingly.
+        """
+        out: Dict[int, Dict[str, float]] = {}
+        for c in range(self.num_classes):
+            if not present[c] or c in self.eval_ignore_classes:
+                continue
+            results = self.sod_packs[c]["FMv2"].get_results()
+            iou_res = results["iou"]
+            dice_res = results["dice"]
+            iou_adp = float(iou_res["adaptive"])
+            iou_dyn = float(np.mean(iou_res["dynamic"]))
+            dice_adp = float(dice_res["adaptive"])
+            dice_dyn = float(np.mean(dice_res["dynamic"]))
+            out[c] = {
+                "iou_adaptive": round(iou_adp, 4),
+                "iou_mean": round(iou_dyn, 4),
+                "dice_adaptive": round(dice_adp, 4),
+                "dice_mean": round(dice_dyn, 4),
+            }
+        return out
+
+    def save_plots(self, path_to_save) -> None:
+        """Row-normalized pixel confusion matrix."""
+        path_to_save = Path(path_to_save)
+        path_to_save.mkdir(parents=True, exist_ok=True)
+
+        cm = self.cm.double()
+        cm_norm = (cm / cm.sum(1, keepdim=True).clamp(min=1)).numpy()
+        class_labels = [str(self.label_to_name[c]) for c in range(self.num_classes)]
+
+        plt.figure(figsize=(max(8, self.num_classes * 0.5), max(6, self.num_classes * 0.45)))
+        plt.imshow(cm_norm, interpolation="nearest", cmap=plt.cm.Blues, vmin=0, vmax=1)
+        plt.title("Pixel Confusion Matrix (row-normalized)")
+        plt.colorbar()
+        tick_marks = np.arange(self.num_classes)
+        plt.xticks(tick_marks, class_labels, rotation=90)
+        plt.yticks(tick_marks, class_labels)
+        plt.ylabel("True class")
+        plt.xlabel("Predicted class")
+        plt.tight_layout()
+        plt.savefig(path_to_save / "confusion_matrix.png")
+        plt.close()
+
+    @staticmethod
+    def _build_sod_metric_pack() -> Dict[str, Any]:
+        """Create one fresh metric pack for one semantic class."""
+        sample_gray = {
+            "with_adaptive": True,
+            "with_dynamic": True,
+        }
+
+        return {
+            "FMv2": py_sod_metrics.FmeasureV2(
+                metric_handlers={
+                    "iou": py_sod_metrics.IOUHandler(
+                        **sample_gray
+                    ),
+                    "dice": py_sod_metrics.DICEHandler(
+                        **sample_gray
+                    ),
+                }
+            ),
+        }
 
 
 def to_uint8_bool(arr):

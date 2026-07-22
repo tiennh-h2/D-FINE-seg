@@ -12,6 +12,7 @@ import torch
 from albumentations.pytorch import ToTensorV2
 from loguru import logger
 from omegaconf import DictConfig
+from pycocotools import mask as mask_utils
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
@@ -122,70 +123,235 @@ def parse_yolo_label_file(path: Path):
     return boxes_norm, polys_norm
 
 
-def load_coco_split(json_path: Path, use_one_class: bool = False):
+def segmentation_to_polygon(segmentation) -> np.ndarray:
     """
-    Load a COCO-format JSON annotation file and pre-parse all annotations.
+    Convert a COCO segmentation into one absolute-coordinate polygon.
+
+    Supports:
+      - COCO polygon format: [[x1, y1, x2, y2, ...], ...]
+      - Flat polygon format: [x1, y1, x2, y2, ...]
+      - Compressed COCO RLE
+      - Uncompressed COCO RLE
+
+    For multi-part segmentations, returns the largest polygon/contour.
 
     Returns:
-      entries: list of dicts, each with:
-          'file_name': str
-          'targets': np.ndarray (N, 5) [class_id, x1, y1, x2, y2] absolute
-          'polys_abs': list of np.ndarray (K, 2) absolute polygon coordinates
-      cat_id_to_class_id: dict mapping COCO category_id -> 0-based contiguous class_id
+        np.ndarray with shape (N, 2), dtype float32.
+        Returns an empty (0, 2) array when conversion is not possible.
     """
-    with open(json_path, "r") as f:
-        coco = json.load(f)
+    empty = np.empty((0, 2), dtype=np.float32)
 
-    categories = sorted(coco.get("categories", []), key=lambda c: c["id"])
-    cat_id_to_class_id = {c["id"]: i for i, c in enumerate(categories)}
+    # Polygon segmentation
+    if isinstance(segmentation, list):
+        if not segmentation:
+            return empty
+
+        # Handle both:
+        # [x1, y1, ...]
+        # [[x1, y1, ...], [x1, y1, ...]]
+        if all(isinstance(value, (int, float)) for value in segmentation):
+            polygon_parts = [segmentation]
+        else:
+            polygon_parts = segmentation
+
+        polygons = []
+
+        for coordinates in polygon_parts:
+            coordinates = np.asarray(
+                coordinates,
+                dtype=np.float32,
+            ).reshape(-1)
+
+            if coordinates.size < 6 or coordinates.size % 2 != 0:
+                continue
+
+            polygon = coordinates.reshape(-1, 2)
+            polygons.append(polygon)
+
+        if not polygons:
+            return empty
+
+        # Choose by geometric area rather than number of coordinates.
+        return max(
+            polygons,
+            key=lambda polygon: abs(cv2.contourArea(polygon)),
+        )
+
+    # RLE segmentation
+    if (
+        isinstance(segmentation, dict)
+        and "size" in segmentation
+        and "counts" in segmentation
+    ):
+        height, width = map(int, segmentation["size"])
+
+        rle = {
+            "size": [height, width],
+            "counts": segmentation["counts"],
+        }
+
+        # Uncompressed RLE has counts as a list.
+        if isinstance(rle["counts"], list):
+            rle = mask_utils.frPyObjects(
+                rle,
+                height,
+                width,
+            )
+
+        # Compressed RLE loaded from JSON usually has counts as str.
+        elif isinstance(rle["counts"], str):
+            rle["counts"] = rle["counts"].encode("ascii")
+
+        mask = mask_utils.decode(rle)
+
+        # Some RLE inputs may decode to H x W x N.
+        if mask.ndim == 3:
+            mask = np.any(mask, axis=2)
+
+        mask = np.ascontiguousarray(
+            mask.astype(np.uint8)
+        )
+
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        valid_contours = [
+            contour
+            for contour in contours
+            if contour.shape[0] >= 3
+        ]
+
+        if not valid_contours:
+            return empty
+
+        largest_contour = max(
+            valid_contours,
+            key=cv2.contourArea,
+        )
+
+        return largest_contour.reshape(-1, 2).astype(
+            np.float32
+        )
+
+    return empty
+
+
+def load_coco_split(
+    json_path: Path,
+    use_one_class: bool = False,
+    skip_crowd: bool = True,
+):
+    """
+    Load and pre-parse a COCO-format annotation file.
+
+    Returns:
+        entries:
+            List of dictionaries containing:
+              - file_name: str
+              - targets: np.ndarray (N, 5)
+                    [class_id, x1, y1, x2, y2]
+              - polys_abs: list[np.ndarray]
+                    One polygon for each target.
+
+        cat_id_to_class_id:
+            Mapping from COCO category ID to contiguous class ID.
+    """
+    with open(json_path, "r", encoding="utf-8") as file:
+        coco = json.load(file)
+
+    categories = sorted(
+        coco.get("categories", []),
+        key=lambda category: category["id"],
+    )
+
+    cat_id_to_class_id = {
+        category["id"]: index
+        for index, category in enumerate(categories)
+    }
 
     img_to_anns = defaultdict(list)
-    for ann in coco.get("annotations", []):
-        img_to_anns[ann["image_id"]].append(ann)
+
+    for annotation in coco.get("annotations", []):
+        img_to_anns[annotation["image_id"]].append(
+            annotation
+        )
 
     entries = []
-    for img_info in coco.get("images", []):
-        img_id = img_info["id"]
-        file_name = img_info["file_name"]
-        anns = img_to_anns.get(img_id, [])
+
+    for image_info in coco.get("images", []):
+        image_id = image_info["id"]
+        file_name = image_info["file_name"]
+
+        annotations = img_to_anns.get(image_id, [])
 
         targets = []
         polys_abs = []
 
-        for ann in anns:
-            if ann.get("iscrowd", 0):
+        for annotation in annotations:
+            if (
+                skip_crowd
+                and annotation.get("iscrowd", 0)
+            ):
                 continue
 
-            cat_id = ann["category_id"]
-            if cat_id not in cat_id_to_class_id:
+            category_id = annotation["category_id"]
+
+            if category_id not in cat_id_to_class_id:
                 continue
 
-            class_id = 0 if use_one_class else cat_id_to_class_id[cat_id]
+            class_id = (
+                0
+                if use_one_class
+                else cat_id_to_class_id[category_id]
+            )
 
-            bx, by, bw, bh = ann["bbox"]
-            targets.append([class_id, bx, by, bx + bw, by + bh])
+            bbox = annotation.get("bbox")
 
-            seg = ann.get("segmentation")
-            if isinstance(seg, list) and len(seg) > 0:
-                largest = max(seg, key=len)
-                if len(largest) >= 6:
-                    poly = np.array(largest, dtype=np.float32).reshape(-1, 2)
-                    polys_abs.append(poly)
-                else:
-                    polys_abs.append(np.empty((0, 2), dtype=np.float32))
-            else:
-                polys_abs.append(np.empty((0, 2), dtype=np.float32))
+            if bbox is None or len(bbox) != 4:
+                continue
 
-        if len(targets) == 0:
-            targets_arr = np.zeros((0, 5), dtype=np.float32)
-            polys_abs = []
+            x, y, width, height = map(float, bbox)
+
+            targets.append(
+                [
+                    class_id,
+                    x,
+                    y,
+                    x + width,
+                    y + height,
+                ]
+            )
+
+            segmentation = annotation.get(
+                "segmentation"
+            )
+
+            polygon = segmentation_to_polygon(
+                segmentation
+            )
+
+            # Always append one polygon per target so indexes align.
+            polys_abs.append(polygon)
+
+        if targets:
+            targets_array = np.asarray(
+                targets,
+                dtype=np.float32,
+            )
         else:
-            targets_arr = np.array(targets, dtype=np.float32)
+            targets_array = np.zeros(
+                (0, 5),
+                dtype=np.float32,
+            )
+            polys_abs = []
 
         entries.append(
             {
                 "file_name": file_name,
-                "targets": targets_arr,
+                "targets": targets_array,
                 "polys_abs": polys_abs,
             }
         )
@@ -713,6 +879,7 @@ class SemSegDataset(Dataset):
         cfg: DictConfig,
     ) -> None:
         self.root_path = root_path
+        self.custom_seg_dataset = cfg.train.custom_seg_dataset
         self.split = split
         self.target_h, self.target_w = img_size
         self.in_channels = int(cfg.train.in_channels)
@@ -844,8 +1011,11 @@ class SemSegDataset(Dataset):
 
     def _load_image_mask(self, idx: int):
         """Load one (image HWC, mask HW) pair at native resolution, or None if unreadable."""
-        image_path = Path(self.split.iloc[idx].values[0])
-        full_path = self.root_path / "images" / f"{image_path}"
+        if self.custom_seg_dataset:
+            full_path = Path(self.split[idx][0])
+        else:
+            image_path = Path(self.split.iloc[idx].values[0])
+            full_path = self.root_path / "images" / f"{image_path}"
         try:
             image = read_image_rgb(full_path, self.in_channels)
         except ValueError as e:
@@ -853,8 +1023,13 @@ class SemSegDataset(Dataset):
             return None
         if image is None:
             return None
-        mask_path = self.root_path / "labels" / f"{image_path.stem}.png"
-        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if self.custom_seg_dataset:
+            mask_path = Path(self.split[idx][1])
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE) // 255
+            # mask = 255 - mask
+        else:
+            mask_path = self.root_path / "labels" / f"{image_path.stem}.png"
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         if mask is None:
             logger.warning(f"Skipping {full_path}: can't read mask")
             return None
@@ -915,7 +1090,7 @@ class SemSegDataset(Dataset):
 
     def __getitem__(self, idx: int):
         """returns (image CHW float, sem_mask (H,W) long, image_path, orig_size (H,W))"""
-        image_path = Path(self.split.iloc[idx].values[0])
+        image_path = Path(self.split[idx][0]) if self.custom_seg_dataset else Path(self.split.iloc[idx].values[0])
         if self.mosaic_prob and random.random() < self.mosaic_prob:
             mosaic = self._load_mosaic(idx)
             if mosaic is None:
@@ -970,6 +1145,7 @@ class Loader:
         self.task = str(cfg.task).lower()
         self.use_one_class = cfg.train.use_one_class
         self.coco_dataset = cfg.train.get("coco_dataset", False)
+        self.custom_seg_dataset = cfg.train.get("custom_seg_dataset", False)
         if self.task == "sem_seg" and self.coco_dataset:
             raise ValueError("task=sem_seg expects PNG masks (labels/), not COCO JSON")
         self.debug_img_processing = debug_img_processing
@@ -981,13 +1157,22 @@ class Loader:
 
     def _get_splits(self) -> None:
         self.splits = {"train": None, "val": None, "test": None}
-        if self.coco_dataset:
+        if self.custom_seg_dataset:
+            self._get_splits_custom_seg_dataset()
+        elif self.coco_dataset:
             self._get_splits_coco()
         else:
             self._get_splits_yolo()
         assert len(self.splits["train"]) and len(self.splits["val"]), (
             f"Train and Val splits must be present at {self.root_path}"
         )
+
+    def _get_splits_custom_seg_dataset(self) -> None:
+        for split_name in self.splits:
+            if split_name == "val":
+                self.splits[split_name] = [(str(img_fp), str(img_fp).replace("/images/", "/masks/")) for img_fp in (self.root_path / "valid" / "images").iterdir()]
+            else:
+                self.splits[split_name] = [(str(img_fp), str(img_fp).replace("/images/", "/masks/")) for img_fp in (self.root_path / split_name / "images").iterdir()]
 
     def _get_splits_yolo(self) -> None:
         for split_name in self.splits:

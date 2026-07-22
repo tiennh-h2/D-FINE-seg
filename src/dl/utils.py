@@ -84,7 +84,8 @@ def log_metrics_locally(
         )
 
     if "mIoU" in metrics_df.columns:  # sem_seg
-        metrics_list = ["mIoU", "pixel_acc"]
+        # metrics_list = ["mIoU", "pixel_acc"]
+        metrics_list = [ "sod_mIoU_mean", "sod_mDice_mean"]
     else:
         metrics_list = [
             "mAP_50",
@@ -546,12 +547,35 @@ def overlay_sem_seg(
     palette: np.ndarray,
     alpha: float = 0.5,
     ignore_index: int = 255,
+    binary_overlay: bool = False,
 ) -> np.ndarray:
-    """Blend a colorized label map over a BGR image; ignore pixels stay unblended."""
+    """
+    Overlay semantic segmentation.
+
+    binary_overlay=False:
+        Original behavior (palette visualization).
+
+    binary_overlay=True:
+        Same behavior as draw_segmentation_mask():
+        - non-zero pixels -> red overlay
+        - background unchanged
+    """
     if label_map.shape != img.shape[:2]:
         label_map = cv2.resize(
-            label_map, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST
+            label_map,
+            (img.shape[1], img.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
         )
+
+    if binary_overlay:
+        red_overlay = np.zeros_like(img)
+        red_overlay[label_map != 0] = (0, 0, 255)
+
+        out = cv2.addWeighted(img, 1 - alpha, red_overlay, alpha, 0)
+        out[label_map == 0] = img[label_map == 0]
+        return out
+
+    # ----- Original behavior -----
     out = cv2.addWeighted(img, 1 - alpha, palette[label_map], alpha, 0)
     keep = label_map == ignore_index
     out[keep] = img[keep]
