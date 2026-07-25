@@ -701,7 +701,8 @@ class Trainer:
         if (self.path_to_save / "last.pt").exists():
             ckpt = torch.load(self.path_to_save / "last.pt", map_location="cpu", weights_only=False)
             if "model" in ckpt:
-                self.model.load_state_dict(ckpt["model"])
+                train_model = self.model.module if isinstance(self.model, DDP) else self.model
+                train_model.load_state_dict(ckpt["model"])
                 self.optimizer.load_state_dict(ckpt["optimizer"])
 
                 if self.scheduler and ckpt["scheduler"] is not None:
@@ -950,7 +951,7 @@ class Trainer:
                 break
 
 
-@hydra.main(version_base=None, config_path="../../", config_name="config_size_m_1600")
+@hydra.main(version_base=None, config_path="../../", config_name="config_size_m_1600_pretrained_on_cubicasa")
 def main(cfg: DictConfig) -> None:
     ddp_enabled = hasattr(cfg.train, "ddp") and cfg.train.ddp.enabled
     if ddp_enabled:
@@ -981,17 +982,30 @@ def main(cfg: DictConfig) -> None:
                 cfg.model_name,
                 len(cfg.train.label_to_name),
                 cfg.task == "segment",
-                cfg.train.device,
+                str(trainer.device),
                 img_size=cfg.train.img_size,
                 in_channels=cfg.train.in_channels,
+                pretrained_model_path=cfg.train.pretrained_model_path,
+                pretrained_backbone=cfg.train.get("imagenet_backbone", False),
                 task=cfg.task,
+                hgnet_v2_config=cfg.train.get("hgnet_v2_config"),
             )
             state_dict = torch.load(
                 Path(cfg.train.path_to_save) / "model.pt",
                 weights_only=True,
             )
             # Use strict=False to bypass loading sam2 weights
-            model.load_state_dict(state_dict, strict=False)
+            incompatible = model.load_state_dict(state_dict, strict=False)
+
+            logger.info(f"Missing keys: {incompatible.missing_keys}")
+            logger.info(f"Unexpected keys: {incompatible.unexpected_keys}")
+
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                raise RuntimeError(
+                    "Final-evaluation model does not match the saved checkpoint.\n"
+                    f"Missing keys: {incompatible.missing_keys}\n"
+                    f"Unexpected keys: {incompatible.unexpected_keys}"
+                )
             if trainer.ema_model:
                 trainer.ema_model.model = model
             else:
