@@ -69,7 +69,8 @@ def build_model(
     pretrained_model_path=None,
     pretrained_backbone=False,
     task=None,  # "sem_seg" swaps DFINETransformer for SemSegDecoder; else by enable_mask_head
-    hgnet_v2_config=None
+    hgnet_v2_config=None,
+    sem_seg_criterion_config=None
 ):
     if int(in_channels) not in (3, 4):
         raise ValueError(
@@ -81,6 +82,8 @@ def build_model(
     model_cfg["HGNetv2"]["pretrained"] = pretrained_backbone
     if hgnet_v2_config:
         model_cfg["HGNetv2"].update(hgnet_v2_config)
+    if sem_seg_criterion_config:
+        model_cfg["SemSegCriterion"].update(sem_seg_criterion_config)
 
     model_cfg["HybridEncoder"]["eval_spatial_size"] = img_size
     model_cfg["DFINETransformer"]["eval_spatial_size"] = img_size

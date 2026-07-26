@@ -397,24 +397,37 @@ class TRT_model:
     def _postprocess_sem_seg(
         self, outputs, processed_sizes, original_sizes
     ) -> List[Dict[str, torch.Tensor]]:
-        """Fused-argmax graph: NEAREST-resize each label map to its original size (on device)."""
-        maps = outputs[0]  # [B, H, W] int32
-        if self.labels_to_use:  # ids not requested -> 255 (ignore/void, not class 0)
-            lbl_set = torch.as_tensor(self.labels_to_use, device=maps.device, dtype=maps.dtype)
-            maps = torch.where(torch.isin(maps, lbl_set), maps, 255)
+        """NEAREST-resize each class-probability map to its original size, then argmax over
+        classes, keeping a prediction only where confidence > 0.5 (otherwise ignore/void, 255)."""
+        probs = outputs[0]          # [B, C, H*W] (TensorRT flattens spatial dims) or [B, C, H, W]\
         results = []
-        for b in range(maps.shape[0]):
-            m = maps[b][None, None].float()  # [1, 1, H, W]
+        for b in range(probs.shape[0]):
+            p = probs[b]                        # [C, H*W] or [C, H, W]
+            proc_h, proc_w = int(processed_sizes[b][0]), int(processed_sizes[b][1])
+
+            if p.dim() == 2:  # [C, H*W] -> [C, H, W]
+                p = p.view(p.shape[0], proc_h, proc_w)
+
             H0, W0 = int(original_sizes[b][0]), int(original_sizes[b][1])
+
             if self.keep_ratio:
-                proc_h, proc_w = int(processed_sizes[b][0]), int(processed_sizes[b][1])
                 gain = min(proc_h / H0, proc_w / W0)
                 padw = round((proc_w - W0 * gain) / 2 - 0.1)
                 padh = round((proc_h - H0 * gain) / 2 - 0.1)
-                m = m[
-                    ..., max(padh, 0) : proc_h - max(padh, 0), max(padw, 0) : proc_w - max(padw, 0)
-                ]
-            m = F.interpolate(m, size=(H0, W0), mode="nearest")[0, 0]
+                p = p[:, max(padh, 0) : proc_h - max(padh, 0), max(padw, 0) : proc_w - max(padw, 0)]
+
+            p_t = p.unsqueeze(0).float()                                # [1, C, h, w]
+            p_t = F.interpolate(p_t, size=(H0, W0), mode="bilinear")     # [1, C, H0, W0]
+            p_t = p_t[0]                                                # [C, H0, W0]
+
+            conf, cls = torch.max(p_t, dim=0)                           # each [H0, W0]
+
+            m = torch.where(conf > 0.5, cls, torch.full_like(cls, 0))
+
+            if self.labels_to_use:  # ids not requested -> 255 (ignore/void, not class 0)
+                lbl_set = torch.as_tensor(self.labels_to_use, device=m.device, dtype=m.dtype)
+                m = torch.where(torch.isin(m, lbl_set), m, torch.full_like(m, 255))
+
             results.append({"sem_seg": m.to(torch.uint8)})
         return results
 

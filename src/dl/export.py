@@ -130,8 +130,9 @@ class SemSegExportWrapper(nn.Module):
         self.model = model
 
     def forward(self, x):
-        logits = self.model(x)["sem_seg_logits"]  # [B, C, H, W]
-        return logits.argmax(1).to(torch.int32)
+        logits = self.model(x)["sem_seg_logits"]
+        pred_probs = torch.softmax(logits, dim=1)
+        return pred_probs
 
     def deploy(self):
         self.model.deploy()

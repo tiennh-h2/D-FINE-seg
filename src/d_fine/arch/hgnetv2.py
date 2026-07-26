@@ -23,11 +23,9 @@ ones_ = nn.init.ones_
 __all__ = ["HGNetv2"]
 
 
-from sam3.model.vitdet import ViT
-
-
 def _create_vit_backbone():
     """Create ViT backbone for visual feature extraction."""
+    from sam3.model.vitdet import ViT
     return ViT(
         img_size=1008,
         pretrain_img_size=336,

@@ -206,7 +206,8 @@ class Trainer:
             pretrained_model_path=cfg.train.pretrained_model_path,
             pretrained_backbone=cfg.train.get("imagenet_backbone", False),
             task=self.task,
-            hgnet_v2_config=cfg.train.get("hgnet_v2_config")
+            hgnet_v2_config=cfg.train.get("hgnet_v2_config"),
+            sem_seg_criterion_config=cfg.train.get("sem_seg_criterion_config")
         )
         if self.distributed:
             if torch.cuda.is_available():
@@ -989,6 +990,7 @@ def main(cfg: DictConfig) -> None:
                 pretrained_backbone=cfg.train.get("imagenet_backbone", False),
                 task=cfg.task,
                 hgnet_v2_config=cfg.train.get("hgnet_v2_config"),
+                sem_seg_criterion_config=cfg.train.get("sem_seg_criterion_config")
             )
             state_dict = torch.load(
                 Path(cfg.train.path_to_save) / "model.pt",

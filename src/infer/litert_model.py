@@ -185,21 +185,35 @@ class LiteRT_model:
     def _postprocess_sem_seg(
         self, outputs, processed_sizes, original_sizes
     ) -> List[Dict[str, torch.Tensor]]:
-        """Fused-argmax graph: NEAREST-resize each label map to its original size."""
-        maps = np.asarray(outputs[0])  # [B, H, W] int
-        if self.labels_to_use:  # ids not requested -> 255 (ignore/void, not class 0)
-            maps = np.where(np.isin(maps, self.labels_to_use), maps, 255)
+        """Argmax over classes, then NEAREST-resize each label map to its original size."""
+        probs = np.asarray(outputs[0])          # [B, C, H, W]
         results = []
-        for b in range(maps.shape[0]):
-            m = maps[b].astype(np.uint8)
+        for b in range(probs.shape[0]):
+            p = probs[b]                        # [C, H, W]
             H0, W0 = int(original_sizes[b][0]), int(original_sizes[b][1])
+
             if self.keep_ratio:
                 proc_h, proc_w = int(processed_sizes[b][0]), int(processed_sizes[b][1])
                 gain = min(proc_h / H0, proc_w / W0)
                 padw = round((proc_w - W0 * gain) / 2 - 0.1)
                 padh = round((proc_h - H0 * gain) / 2 - 0.1)
-                m = m[max(padh, 0) : proc_h - max(padh, 0), max(padw, 0) : proc_w - max(padw, 0)]
-            m = cv2.resize(m, (W0, H0), interpolation=cv2.INTER_NEAREST)
+                p = p[:, max(padh, 0) : proc_h - max(padh, 0), max(padw, 0) : proc_w - max(padw, 0)]
+
+            # cv2.resize needs channels last
+            p = np.transpose(p, (1, 2, 0))                   # [H, W, C]
+            p = cv2.resize(p, (W0, H0), interpolation=cv2.INTER_LINEAR)
+            if p.ndim == 2:  # cv2 squeezes a single-channel result
+                p = p[:, :, None]
+            p = np.transpose(p, (2, 0, 1))                   # [C, H0, W0]
+
+            cls = np.argmax(p, axis=0).astype(np.uint8)      # [H0, W0]
+            conf = np.max(p, axis=0)                         # [H0, W0]
+
+            m = np.where(conf > 0.5, cls, 0).astype(np.uint8)
+
+            if self.labels_to_use:  # ids not requested -> 255 (ignore/void, not class 0)
+                m = np.where(np.isin(m, self.labels_to_use), m, 255).astype(np.uint8)
+
             results.append({"sem_seg": torch.from_numpy(m)})
         return results
 

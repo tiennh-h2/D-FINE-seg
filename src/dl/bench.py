@@ -88,10 +88,9 @@ def test_model_sem_seg(
     n_vis = 0
     for _, _, img_paths in tqdm(test_loader, total=len(test_loader)):
         for img_path in img_paths:
-            if use_custom_seg_dataset:
-                read_image_hwc(data_path / "images" / img_path)
-            else:
-                img = read_image_hwc(data_path / "images" / img_path)
+            if not use_custom_seg_dataset:
+                img_path = data_path / "images" / img_path
+            img = read_image_hwc(img_path)
             is_npy = Path(img_path).suffix.lower() == ".npy"
 
             if torch.cuda.is_available():
@@ -104,12 +103,14 @@ def test_model_sem_seg(
 
             pred_map = preds[0]["sem_seg"].cpu()
             if use_custom_seg_dataset:
-                mask_path = data_path / "labels" / f"{Path(img_path).stem}.png"
+                mask_path = str(img_path).replace("/images/", "/masks/")
             else:
-                mask_path = data_path / "labels" / f"{Path(img_path).stem}.png"
-            gt = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+                mask_path = str(data_path / "labels" / f"{Path(img_path).stem}.png")
+            gt = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             if gt is None:
                 raise FileNotFoundError(f"Can't read GT mask {mask_path}")
+            if use_custom_seg_dataset:
+                gt //= 255
             validator.update(pred_map, torch.from_numpy(gt))
 
             if to_visualize and n_vis < max_vis:
@@ -259,7 +260,7 @@ def test_model(
     return metrics
 
 
-@hydra.main(version_base=None, config_path="../../", config_name="config")
+@hydra.main(version_base=None, config_path="../../", config_name="config_size_m_1600")
 def main(cfg: DictConfig):
     torch.multiprocessing.set_sharing_strategy("file_system")
 

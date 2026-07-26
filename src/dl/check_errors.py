@@ -267,7 +267,10 @@ def run_sem_seg(model, train_loader, val_loader, cfg: DictConfig) -> None:
             img = read_image_hwc(data_path / "images" / img_path)
             is_npy = img_path.suffix.lower() == ".npy"
 
-            mask_path = data_path / "labels" / f"{img_path.stem}.png"
+            if cfg.train.custom_seg_dataset:
+                mask_path = data_path / "masks" / f"{img_path.stem}.png"
+            else:
+                mask_path = data_path / "labels" / f"{img_path.stem}.png"
             gt = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             if gt is None:
                 raise FileNotFoundError(f"Can't read GT mask {mask_path}")
