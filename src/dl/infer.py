@@ -4,6 +4,8 @@ from shutil import rmtree
 import cv2
 import hydra
 import numpy as np
+from numbers import Integral
+
 from loguru import logger
 from omegaconf import DictConfig
 from tqdm import tqdm
@@ -156,50 +158,257 @@ def run_images(
             f.write(f"{label_to_name[int(class_id)]}\n")
 
 
-def run_images_sem_seg(torch_model, folder_path, output_path, label_to_name, use_custom_seg_dataset:bool=False):
-    """Overlay + raw label-map PNG per image; crops/YOLO txt are box-based -> skipped."""
+def _normalize_tile_size(tile_size):
+    if isinstance(tile_size, Integral) and not isinstance(tile_size, bool):
+        tile_height = tile_width = int(tile_size)
+    elif isinstance(tile_size, (tuple, list)) and len(tile_size) == 2:
+        tile_height, tile_width = tile_size
+        if not all(
+            isinstance(value, Integral) and not isinstance(value, bool)
+            for value in (tile_height, tile_width)
+        ):
+            raise ValueError("tile_size values must be integers")
+        tile_height, tile_width = int(tile_height), int(tile_width)
+    else:
+        raise ValueError("tile_size must be an int or a (height, width) pair")
+
+    if tile_height <= 0 or tile_width <= 0:
+        raise ValueError("tile_size values must be greater than zero")
+
+    return tile_height, tile_width
+
+
+def _tile_starts(length, tile_length, overlap):
+    if length <= 0:
+        raise ValueError("image dimensions must be greater than zero")
+    if tile_length <= 0:
+        raise ValueError("tile dimensions must be greater than zero")
+    if not 0 <= overlap < 1:
+        raise ValueError("tile_overlap must be in the range [0, 1)")
+    if tile_length >= length:
+        return [0]
+
+    stride = max(1, int(round(tile_length * (1 - overlap))))
+    starts = list(range(0, length - tile_length + 1, stride))
+    final_start = length - tile_length
+    if starts[-1] != final_start:
+        starts.append(final_start)
+    return starts
+
+
+def _to_numpy(prediction):
+    if hasattr(prediction, "detach"):
+        prediction = prediction.detach()
+    if hasattr(prediction, "cpu"):
+        prediction = prediction.cpu()
+    if hasattr(prediction, "numpy"):
+        prediction = prediction.numpy()
+    return np.asarray(prediction)
+
+
+def _run_sliced_sem_seg(
+    torch_model,
+    image,
+    *,
+    bgr,
+    num_classes,
+    use_instance_segmentation_dataset=False,
+    tile_size=1024,
+    tile_overlap=0.2,
+    img_path=None
+):
+    """Infer overlapping tiles and merge them into one full-size class map."""
+    tile_height, tile_width = _normalize_tile_size(tile_size)
+    if not 0 <= tile_overlap < 1:
+        raise ValueError("tile_overlap must be in the range [0, 1)")
+    if num_classes <= 0:
+        raise ValueError("num_classes must be greater than zero")
+
+    image_height, image_width = image.shape[:2]
+    y_starts = _tile_starts(image_height, tile_height, tile_overlap)
+    x_starts = _tile_starts(image_width, tile_width, tile_overlap)
+
+    score_sum = None
+    score_count = None
+    class_votes = None
+    output_rank = None
+
+    for y1 in y_starts:
+        y2 = min(y1 + tile_height, image_height)
+        for x1 in x_starts:
+            x2 = min(x1 + tile_width, image_width)
+            
+            tile = image[y1:y2, x1:x2]
+            prediction = _to_numpy(torch_model(tile, bgr=bgr)[0]["sem_seg"])
+
+            # debug_tiles_dir = Path("debug_tiles")
+            # debug_tiles_dir.mkdir(parents=True, exist_ok=True)
+
+            # tile = image[y1:y2, x1:x2]
+
+            # # OpenCV expects BGR when saving.
+            # debug_tile = tile[..., :3]
+            # if not bgr:
+            #     debug_tile = cv2.cvtColor(debug_tile, cv2.COLOR_RGB2BGR)
+
+            # debug_path = debug_tiles_dir / (
+            #     f"{Path(img_path).stem}_x{x1}-{x2}_y{y1}-{y2}.png"
+            # )
+
+            # if not cv2.imwrite(str(debug_path), debug_tile):
+            #     logger.warning(f"Failed to save debug tile: {debug_path}")
+
+            # prediction = _to_numpy(
+            #     torch_model(tile, bgr=bgr)[0]["sem_seg"]
+            # )
+
+            if prediction.ndim not in (2, 3):
+                raise ValueError(
+                    "sem_seg must have shape (H, W) or (C, H, W); "
+                    f"received {prediction.shape}"
+                )
+            if prediction.shape[-2:] != tile.shape[:2]:
+                raise ValueError(
+                    "sem_seg spatial size must match its input tile; "
+                    f"received {prediction.shape[-2:]} for tile {tile.shape[:2]}"
+                )
+            if output_rank is None:
+                output_rank = prediction.ndim
+            elif prediction.ndim != output_rank:
+                raise ValueError("sem_seg output rank changed between tiles")
+
+            if prediction.ndim == 3 or use_instance_segmentation_dataset:
+                if not use_instance_segmentation_dataset and prediction.shape[0] != num_classes:
+                    raise ValueError(
+                        f"Expected {num_classes} logit channels, "
+                        f"received {prediction.shape[0]}"
+                    )
+                if score_sum is None:
+                    if use_instance_segmentation_dataset:
+                        score_sum = np.zeros(
+                            (image_height, image_width),
+                            dtype=np.float32,
+                        )
+                    else:
+                        score_sum = np.zeros(
+                            (num_classes, image_height, image_width),
+                            dtype=np.float32,
+                        )
+                    score_count = np.zeros(
+                        (image_height, image_width),
+                        dtype=np.uint16,
+                    )
+                if use_instance_segmentation_dataset:
+                    score_sum[y1:y2, x1:x2] += prediction.astype(
+                        np.float32, copy=False
+                    )
+                else:
+                    score_sum[:, y1:y2, x1:x2] += prediction.astype(
+                        np.float32, copy=False
+                    )
+                score_count[y1:y2, x1:x2] += 1
+            else:
+                if not np.all(np.isfinite(prediction)):
+                    raise ValueError("Class-map predictions contain non-finite values")
+                rounded_prediction = np.rint(prediction)
+                if not np.allclose(prediction, rounded_prediction):
+                    raise ValueError(
+                        "A 2D sem_seg output must contain integer class IDs"
+                    )
+                prediction = rounded_prediction.astype(np.int64, copy=False)
+                if prediction.min() < 0 or prediction.max() >= num_classes:
+                    raise ValueError(
+                        f"Class IDs must be between 0 and {num_classes - 1}"
+                    )
+                if class_votes is None:
+                    class_votes = np.zeros(
+                        (num_classes, image_height, image_width),
+                        dtype=np.uint16,
+                    )
+                for class_id in np.unique(prediction):
+                    class_votes[class_id, y1:y2, x1:x2] += (
+                        prediction == class_id
+                    )
+
+    if use_instance_segmentation_dataset:
+        average_scores = score_sum / score_count
+        return (average_scores > 0.5)*1
+    if output_rank == 3:
+        average_scores = score_sum / score_count[None, :, :]
+        return np.argmax(average_scores, axis=0)
+    return np.argmax(class_votes, axis=0)
+
+
+def run_images_sem_seg(
+    torch_model,
+    folder_path,
+    output_path,
+    label_to_name,
+    use_instance_segmentation_dataset: bool = False,
+    slice_inference: bool = False,
+    tile_size=1024,
+    tile_overlap: float = 0.2,
+):
+    """Write overlay images and raw label maps, optionally using tiled inference."""
     palette = sem_seg_palette(len(label_to_name))
     (output_path / "images").mkdir(parents=True, exist_ok=True)
     (output_path / "labels").mkdir(parents=True, exist_ok=True)
     labels = set()
-    img_paths = [img.name for img in folder_path.iterdir() if not img.name.startswith(".")]
+    img_paths = [
+        image.name for image in folder_path.iterdir() if not image.name.startswith(".")
+    ]
+
     for img_path in tqdm(img_paths):
         img = read_image_hwc(folder_path / img_path)
         if img is None:
             logger.warning(f"Skipping unreadable image: {img_path}")
             continue
+
         is_npy = Path(img_path).suffix.lower() == ".npy"
-        label_map = torch_model(img, bgr=not is_npy)[0]["sem_seg"].cpu().numpy()
+        if slice_inference:
+            label_map = _run_sliced_sem_seg(
+                torch_model,
+                img,
+                bgr=not is_npy,
+                num_classes=len(label_to_name),
+                use_instance_segmentation_dataset=use_instance_segmentation_dataset,
+                tile_size=tile_size,
+                tile_overlap=tile_overlap,
+                img_path=img_path
+            )
+        else:
+            label_map = _to_numpy(
+                torch_model(img, bgr=not is_npy)[0]["sem_seg"]
+            )
 
         vis_img = img[:, :, :3] if img.shape[2] > 3 else img
         if is_npy:
             vis_img = np.ascontiguousarray(vis_img[..., ::-1])
-        
+
         cv2.imwrite(
             str(output_path / "images" / f"{Path(img_path).stem}.jpg"),
             overlay_sem_seg(
                 vis_img,
                 label_map,
                 palette,
-                binary_overlay=use_custom_seg_dataset,
+                binary_overlay=use_instance_segmentation_dataset,
             ),
         )
-        # GT-style output: grayscale PNG, pixel value = class id
+
         save_label = (
             (label_map * 255).astype(np.uint8)
-            if use_custom_seg_dataset
+            if use_instance_segmentation_dataset
             else label_map.astype(np.uint8)
         )
-
         cv2.imwrite(
             str(output_path / "labels" / f"{Path(img_path).stem}.png"),
             save_label,
         )
         labels.update(np.unique(label_map).tolist())
 
-    with open(output_path / "labels.txt", "w") as f:
+    with open(output_path / "labels.txt", "w") as file:
         for class_id in sorted(labels):
-            f.write(f"{label_to_name[int(class_id)]}\n")
+            file.write(f"{label_to_name[int(class_id)]}\n")
 
 
 def run_videos_sem_seg(torch_model, folder_path, output_path, label_to_name):
@@ -390,7 +599,7 @@ def run_videos_tracked(torch_model, folder_path, output_path, label_to_name, tra
         _run_video_tracked(torch_model, tracker, visualizer, video_path, out_path)
 
 
-@hydra.main(version_base=None, config_path="../../", config_name="config_size_m_1600")
+@hydra.main(version_base=None, config_path="../../", config_name="config_size_m_1600_fbm_ft_from_yap_ckpt")
 def main(cfg: DictConfig):
     cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
 
@@ -434,6 +643,7 @@ def main(cfg: DictConfig):
         rect=cfg.export.dynamic_input,
         channels=cfg.train.in_channels,
         task=cfg.task,
+        return_probs=cfg.infer.slice_inference
     )
 
     if data_type == "video" and cfg.train.in_channels != 3:
@@ -448,7 +658,7 @@ def main(cfg: DictConfig):
     if data_type == "image":
         if cfg.task == "sem_seg":
             run_images_sem_seg(
-                torch_model, folder_path, output_path, label_to_name=cfg.train.label_to_name, use_custom_seg_dataset=cfg.train.custom_seg_dataset
+                torch_model, folder_path, output_path, label_to_name=cfg.train.label_to_name, use_instance_segmentation_dataset=cfg.train.instance_segmentation_dataset, slice_inference=cfg.infer.get("slice_inference"), tile_size=cfg.infer.get("tile_size"), tile_overlap=cfg.infer.get("tile_overlap")
             )
         else:
             run_images(

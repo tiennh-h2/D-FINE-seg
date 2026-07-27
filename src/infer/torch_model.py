@@ -30,6 +30,7 @@ class Torch_model:
         device: str = None,
         channels: int = 3,
         task: str = None,  # detect | segment | sem_seg; overrides enable_mask_head
+        return_probs: bool = False
     ):
         self.input_size = (input_height, input_width)
         self.n_outputs = n_outputs
@@ -46,6 +47,7 @@ class Torch_model:
         self.debug_mode = False
         self.binarize_masks = binarize_masks
         self.mask_threshold = mask_threshold
+        self.return_probs = return_probs
 
         if isinstance(conf_thresh, float):
             self.conf_threshs = [conf_thresh] * self.n_outputs
@@ -238,7 +240,11 @@ class Torch_model:
                 )
 
             foreground_prob = pred_probs[0, 1]  # (H0, W0)
-            sem_seg = (foreground_prob > self.mask_threshold).long()
+
+            if self.return_probs:
+                sem_seg = foreground_prob
+            else:
+                sem_seg = (foreground_prob > self.mask_threshold).long()
 
             if labels_to_use:
                 keep = torch.as_tensor(
@@ -252,7 +258,10 @@ class Torch_model:
                     torch.full_like(sem_seg, 255),
                 )
 
-            results.append({"sem_seg": sem_seg.to(torch.uint8)})
+            if self.return_probs:
+                results.append({"sem_seg": sem_seg})
+            else:
+                results.append({"sem_seg": sem_seg.to(torch.uint8)})
 
         return results
 

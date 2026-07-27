@@ -267,7 +267,7 @@ def run_sem_seg(model, train_loader, val_loader, cfg: DictConfig) -> None:
             img = read_image_hwc(data_path / "images" / img_path)
             is_npy = img_path.suffix.lower() == ".npy"
 
-            if cfg.train.custom_seg_dataset:
+            if cfg.train.instance_segmentation_dataset:
                 mask_path = data_path / "masks" / f"{img_path.stem}.png"
             else:
                 mask_path = data_path / "labels" / f"{img_path.stem}.png"

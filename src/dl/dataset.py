@@ -860,6 +860,47 @@ class CustomDataset(Dataset):
         return len(self.split)
 
 
+def _axis_slice_starts(
+    length: int,
+    slice_size: int,
+    overlap_ratio: float,
+) -> list[int]:
+    """Return gap-free SAHI-style slice starts for one image axis."""
+    if length <= 0:
+        raise ValueError(f"Image axis length must be positive, got {length}")
+    if slice_size <= 0:
+        raise ValueError(f"SAHI slice size must be positive, got {slice_size}")
+    if not 0.0 <= overlap_ratio < 1.0:
+        raise ValueError(
+            f"SAHI overlap ratio must be in [0, 1), got {overlap_ratio}"
+        )
+
+    max_start = max(length - slice_size, 0)
+    step = max(int(slice_size * (1.0 - overlap_ratio)), 1)
+    starts = list(range(0, max_start + 1, step))
+    if starts[-1] != max_start:
+        starts.append(max_start)
+    return starts
+
+
+def _build_sahi_crop_boxes(
+    image_h: int,
+    image_w: int,
+    slice_h: int,
+    slice_w: int,
+    overlap_h: float,
+    overlap_w: float,
+) -> list[tuple[int, int, int, int]]:
+    """Build `(x1, y1, x2, y2)` crops covering an image without duplicates."""
+    y_starts = _axis_slice_starts(image_h, slice_h, overlap_h)
+    x_starts = _axis_slice_starts(image_w, slice_w, overlap_w)
+    return [
+        (x1, y1, min(x1 + slice_w, image_w), min(y1 + slice_h, image_h))
+        for y1 in y_starts
+        for x1 in x_starts
+    ]
+
+
 class SemSegDataset(Dataset):
     """Dense per-pixel labels for task=sem_seg.
 
@@ -879,7 +920,7 @@ class SemSegDataset(Dataset):
         cfg: DictConfig,
     ) -> None:
         self.root_path = root_path
-        self.custom_seg_dataset = cfg.train.custom_seg_dataset
+        self.instance_segmentation_dataset = cfg.train.instance_segmentation_dataset
         self.split = split
         self.target_h, self.target_w = img_size
         self.in_channels = int(cfg.train.in_channels)
@@ -900,6 +941,7 @@ class SemSegDataset(Dataset):
         self.mosaic_prob = resolve_mosaic_prob(cfg) if mode == "train" else 0.0
         self.ignore_background = False
         self.keep_ratio = cfg.train.keep_ratio
+        self._init_sahi(cfg)
         self._init_augs(cfg)
 
     @property
@@ -909,6 +951,84 @@ class SemSegDataset(Dataset):
     @mosaic_prob.setter
     def mosaic_prob(self, value: float) -> None:
         self._shared_flags[0] = float(value)
+
+    @staticmethod
+    def _validate_image_mask_dimensions(image, mask, source_idx: int) -> None:
+        if image.shape[:2] != mask.shape[:2]:
+            raise ValueError(
+                "Image and mask dimensions must match for source index "
+                f"{source_idx}, got image={image.shape[:2]} and mask={mask.shape[:2]}"
+            )
+
+    def _init_sahi(self, cfg) -> None:
+        """Build a virtual index containing one entry per SAHI crop."""
+        sahi_cfg = getattr(cfg.train, "sahi", None)
+        self.sahi_enabled = (
+            self.mode == "train"
+            and sahi_cfg is not None
+            and bool(getattr(sahi_cfg, "enabled", False))
+        )
+        self._sample_index = []
+
+        if not self.sahi_enabled:
+            self._sample_index.extend((source_idx, None) for source_idx in range(len(self.split)))
+            return
+
+        self.sahi_slice_height = int(sahi_cfg.slice_height)
+        self.sahi_slice_width = int(sahi_cfg.slice_width)
+        self.sahi_overlap_height_ratio = float(sahi_cfg.overlap_height_ratio)
+        self.sahi_overlap_width_ratio = float(sahi_cfg.overlap_width_ratio)
+        if self.sahi_slice_height <= 0 or self.sahi_slice_width <= 0:
+            raise ValueError(
+                "SAHI slice size must be positive, got "
+                f"{(self.sahi_slice_height, self.sahi_slice_width)}"
+            )
+        if not (
+            0.0 <= self.sahi_overlap_height_ratio < 1.0
+            and 0.0 <= self.sahi_overlap_width_ratio < 1.0
+        ):
+            raise ValueError(
+                "SAHI overlap ratios must be in [0, 1), got "
+                f"{(self.sahi_overlap_height_ratio, self.sahi_overlap_width_ratio)}"
+            )
+
+        for source_idx in range(len(self.split)):
+            loaded = self._load_image_mask(source_idx)
+            if loaded is None:
+                raise ValueError(
+                    f"Cannot build SAHI crops: source index {source_idx} is unreadable"
+                )
+            image, mask = loaded
+            self._validate_image_mask_dimensions(image, mask, source_idx)
+            crop_boxes = _build_sahi_crop_boxes(
+                image_h=image.shape[0],
+                image_w=image.shape[1],
+                slice_h=self.sahi_slice_height,
+                slice_w=self.sahi_slice_width,
+                overlap_h=self.sahi_overlap_height_ratio,
+                overlap_w=self.sahi_overlap_width_ratio,
+            )
+            self._sample_index.extend((source_idx, crop_box) for crop_box in crop_boxes)
+
+    def _load_sample(self, idx: int):
+        """Load one full source pair or one aligned SAHI image/mask crop."""
+        source_idx, crop_box = self._sample_index[idx]
+        loaded = self._load_image_mask(source_idx)
+        if loaded is None:
+            return None
+        image, mask = loaded
+        self._validate_image_mask_dimensions(image, mask, source_idx)
+        if crop_box is None:
+            return image, mask
+
+        x1, y1, x2, y2 = crop_box
+        image_h, image_w = image.shape[:2]
+        if x2 > image_w or y2 > image_h:
+            raise ValueError(
+                f"SAHI crop {crop_box} exceeds image dimensions {(image_h, image_w)} "
+                f"for source index {source_idx}"
+            )
+        return image[y1:y2, x1:x2], mask[y1:y2, x1:x2]
 
     def _init_augs(self, cfg) -> None:
         pad_color = tuple([114] * self.in_channels)
@@ -1011,7 +1131,7 @@ class SemSegDataset(Dataset):
 
     def _load_image_mask(self, idx: int):
         """Load one (image HWC, mask HW) pair at native resolution, or None if unreadable."""
-        if self.custom_seg_dataset:
+        if self.instance_segmentation_dataset:
             full_path = Path(self.split[idx][0])
         else:
             image_path = Path(self.split.iloc[idx].values[0])
@@ -1023,7 +1143,7 @@ class SemSegDataset(Dataset):
             return None
         if image is None:
             return None
-        if self.custom_seg_dataset:
+        if self.instance_segmentation_dataset:
             mask_path = Path(self.split[idx][1])
             mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE) // 255
             # mask = 255 - mask
@@ -1051,13 +1171,13 @@ class SemSegDataset(Dataset):
         H, W = self.target_h, self.target_w
         yc = int(random.uniform(H * 0.6, H * 1.4))
         xc = int(random.uniform(W * 0.6, W * 1.4))
-        indices = [idx] + [random.randint(0, len(self.split) - 1) for _ in range(3)]
+        indices = [idx] + [random.randint(0, len(self) - 1) for _ in range(3)]
         img4 = np.full((H * 2, W * 2, self.in_channels), 114, dtype=np.uint8)
         mask4 = np.full((H * 2, W * 2), self.ignore_index, dtype=np.uint8)
         for i, m_idx in enumerate(indices):
-            r, retries = self._load_image_mask(m_idx), 0
+            r, retries = self._load_sample(m_idx), 0
             while r is None and retries < 3:
-                r = self._load_image_mask(random.randint(0, len(self.split) - 1))
+                r = self._load_sample(random.randint(0, len(self) - 1))
                 retries += 1
             if r is None:
                 return None
@@ -1077,12 +1197,102 @@ class SemSegDataset(Dataset):
             M[:2],
             dsize=(W, H),
             flags=cv2.INTER_LINEAR,
-            borderValue=tuple([114] * self.in_channels),
+            borderValue=tuple([255] * self.in_channels),
         )
         mask4 = cv2.warpAffine(
-            mask4, M[:2], dsize=(W, H), flags=cv2.INTER_NEAREST, borderValue=self.ignore_index
+            mask4, M[:2], dsize=(W, H), flags=cv2.INTER_NEAREST, borderValue=0 if self.instance_segmentation_dataset else self.ignore_index
         )
         return img4, mask4
+
+    def _concat_pad(self, tiles, axis, rotate_p=0.3):
+        """Concatenate (img, mask) tiles along axis (0=vertical stack, 1=horizontal stack),
+        padding the non-concat dimension with 114/ignore_index so nothing gets cropped.
+        Each tile is independently rotated 90 CW/CCW with probability rotate_p before
+        concatenation (rotation applied before padding, so it affects alignment too)."""
+        rotated = []
+        for img, mask in tiles:
+            if random.random() < rotate_p:
+                k = random.choice([cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE])
+                img = cv2.rotate(img, k)
+                mask = cv2.rotate(mask, k)
+            rotated.append((img, mask))
+        tiles = rotated
+
+        other_axis = 1 - axis
+        max_dim = max(t[0].shape[other_axis] for t in tiles)
+
+        padded_imgs, padded_masks = [], []
+        for img, mask in tiles:
+            pad = max_dim - img.shape[other_axis]
+            if pad > 0:
+                if axis == 0:  # stacking rows -> pad width (right side)
+                    border = (0, 0, 0, pad)
+                else:  # stacking cols -> pad height (bottom side)
+                    border = (0, pad, 0, 0)
+                img = cv2.copyMakeBorder(
+                    img, *border, cv2.BORDER_CONSTANT, value=[255] * self.in_channels
+                )
+                mask = cv2.copyMakeBorder(
+                    mask, *border, cv2.BORDER_CONSTANT, value=0 if self.instance_segmentation_dataset else self.ignore_index
+                )
+            padded_imgs.append(img)
+            padded_masks.append(mask)
+
+        img_cat = np.concatenate(padded_imgs, axis=axis)
+        mask_cat = np.concatenate(padded_masks, axis=axis)
+        return img_cat, mask_cat
+
+
+    def _concat_images(self, idx: int):
+        """Crop-free mosaic: picks 1-3 plans and lays them out fully intact — vertical stack,
+        horizontal stack, or a mixed grid (one big tile beside two stacked smaller ones) for 3
+        plans. Mismatched edges are padded with 114/ignore_index, never cropped. The combined
+        canvas is resized once (LINEAR for image, NEAREST for mask) to the target size — the
+        only place any content gets shrunk, and nothing is ever cut off."""
+        n = random.choices([2, 3, 4])[0]
+        indices = [idx] + [random.randint(0, len(self) - 1) for _ in range(n - 1)]
+
+        tiles = []
+        for m_idx in indices:
+            r, retries = self._load_sample(m_idx), 0
+            while r is None and retries < 3:
+                r = self._load_sample(random.randint(0, len(self) - 1))
+                retries += 1
+            if r is None:
+                return None
+            tiles.append(r)
+
+        if n == 1:
+            img, mask = tiles[0]
+
+        elif n == 2:
+            axis = random.choice([0, 1])  # 0 = vertical stack, 1 = horizontal stack
+            if random.random() < 0.5:
+                tiles = tiles[::-1]
+            img, mask = self._concat_pad(tiles, axis)
+
+        else:  # n == 3
+            layout = random.choice(["vertical", "horizontal", "mixed"])
+            random.shuffle(tiles)
+
+            if layout == "vertical":
+                img, mask = self._concat_pad(tiles, axis=0)
+            elif layout == "horizontal":
+                img, mask = self._concat_pad(tiles, axis=1)
+            else:  # mixed: one big tile beside two stacked smaller ones
+                big, *rest = tiles
+                inner_axis = random.choice([0, 1])       # how the two small tiles stack
+                outer_axis = 1 - inner_axis               # how big joins the stacked pair
+                sub_img, sub_mask = self._concat_pad(rest, axis=inner_axis)
+                pieces = [big, (sub_img, sub_mask)]
+                if random.random() < 0.5:
+                    pieces = pieces[::-1]
+                img, mask = self._concat_pad(pieces, axis=outer_axis)
+
+        img = cv2.resize(img, (self.target_w, self.target_h), interpolation=cv2.INTER_LINEAR)
+        mask = cv2.resize(mask, (self.target_w, self.target_h), interpolation=cv2.INTER_NEAREST)
+        return img, mask
+
 
     def close_mosaic(self):
         self.mosaic_prob = 0.0
@@ -1090,16 +1300,24 @@ class SemSegDataset(Dataset):
 
     def __getitem__(self, idx: int):
         """returns (image CHW float, sem_mask (H,W) long, image_path, orig_size (H,W))"""
-        image_path = Path(self.split[idx][0]) if self.custom_seg_dataset else Path(self.split.iloc[idx].values[0])
+        source_idx, _ = self._sample_index[idx]
+        image_path = (
+            Path(self.split[source_idx][0])
+            if self.instance_segmentation_dataset
+            else Path(self.split.iloc[source_idx].values[0])
+        )
         if self.mosaic_prob and random.random() < self.mosaic_prob:
-            mosaic = self._load_mosaic(idx)
+            if random.random() < 0.5:
+                mosaic = self._load_mosaic(idx)
+            else:
+                mosaic = self._concat_images(idx)
             if mosaic is None:
                 return None
             image, sem_mask = mosaic
             orig_size = torch.tensor([self.target_h, self.target_w])  # train-only; orig res unused
             transformed = self.mosaic_transform(image=image, mask=sem_mask)  # already target-size
         else:
-            r = self._load_image_mask(idx)
+            r = self._load_sample(idx)
             if r is None:
                 return None
             image, sem_mask = r
@@ -1114,7 +1332,7 @@ class SemSegDataset(Dataset):
         return image_t, sem_mask_t, image_path, orig_size
 
     def __len__(self):
-        return len(self.split)
+        return len(self._sample_index)
 
 
 def sem_seg_collate_fn(batch):
@@ -1145,7 +1363,7 @@ class Loader:
         self.task = str(cfg.task).lower()
         self.use_one_class = cfg.train.use_one_class
         self.coco_dataset = cfg.train.get("coco_dataset", False)
-        self.custom_seg_dataset = cfg.train.get("custom_seg_dataset", False)
+        self.instance_segmentation_dataset = cfg.train.get("instance_segmentation_dataset", False)
         if self.task == "sem_seg" and self.coco_dataset:
             raise ValueError("task=sem_seg expects PNG masks (labels/), not COCO JSON")
         self.debug_img_processing = debug_img_processing
@@ -1157,8 +1375,8 @@ class Loader:
 
     def _get_splits(self) -> None:
         self.splits = {"train": None, "val": None, "test": None}
-        if self.custom_seg_dataset:
-            self._get_splits_custom_seg_dataset()
+        if self.instance_segmentation_dataset:
+            self._get_splits_instance_segmentation_dataset()
         elif self.coco_dataset:
             self._get_splits_coco()
         else:
@@ -1167,7 +1385,7 @@ class Loader:
             f"Train and Val splits must be present at {self.root_path}"
         )
 
-    def _get_splits_custom_seg_dataset(self) -> None:
+    def _get_splits_instance_segmentation_dataset(self) -> None:
         for split_name in self.splits:
             if split_name == "val":
                 self.splits[split_name] = [(str(img_fp), str(img_fp).replace("/images/", "/masks/")) for img_fp in (self.root_path / "valid" / "images").iterdir()]

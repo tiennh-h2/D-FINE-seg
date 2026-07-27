@@ -101,7 +101,7 @@ class Trainer:
             self.local_rank = 0
             self.device = torch.device(cfg.train.device)
 
-        self.custom_seg_dataset = cfg.train.custom_seg_dataset
+        self.instance_segmentation_dataset = cfg.train.instance_segmentation_dataset
         self.conf_thresh = cfg.train.conf_thresh
         self.iou_thresh = cfg.train.iou_thresh
         self.epochs = cfg.train.epochs
@@ -523,11 +523,11 @@ class Trainer:
                 proc_h, proc_w = preds.shape[1], preds.shape[2]
 
                 for b, img_path in enumerate(img_paths):
-                    mask_path = str(img_path).replace("/images/", "/masks/") if self.custom_seg_dataset else labels_dir / f"{Path(img_path).stem}.png"
+                    mask_path = str(img_path).replace("/images/", "/masks/") if self.instance_segmentation_dataset else labels_dir / f"{Path(img_path).stem}.png"
                     gt = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
                     if gt is None:
                         raise FileNotFoundError(f"Can't read GT mask {mask_path}")
-                    if self.custom_seg_dataset:
+                    if self.instance_segmentation_dataset:
                         # gt = 255 - gt
                         gt //= 255
                     gt_t = torch.from_numpy(gt).to(self.device)
@@ -952,7 +952,7 @@ class Trainer:
                 break
 
 
-@hydra.main(version_base=None, config_path="../../", config_name="config_size_m_1600_pretrained_on_cubicasa")
+@hydra.main(version_base=None, config_path="../../", config_name="config")
 def main(cfg: DictConfig) -> None:
     ddp_enabled = hasattr(cfg.train, "ddp") and cfg.train.ddp.enabled
     if ddp_enabled:

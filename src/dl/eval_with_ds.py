@@ -205,7 +205,7 @@ def run_images(
             f.write(f"{label_to_name[int(class_id)]}\n")
 
 
-def run_images_sem_seg(torch_model, folder_path, output_path, label_to_name, use_custom_seg_dataset:bool=False):
+def run_images_sem_seg(torch_model, folder_path, output_path, label_to_name, use_instance_segmentation_dataset:bool=False):
     """Overlay + raw label-map PNG per image; crops/YOLO txt are box-based -> skipped."""
     palette = sem_seg_palette(len(label_to_name))
     (output_path / "images").mkdir(parents=True, exist_ok=True)
@@ -230,13 +230,13 @@ def run_images_sem_seg(torch_model, folder_path, output_path, label_to_name, use
                 vis_img,
                 label_map,
                 palette,
-                binary_overlay=use_custom_seg_dataset,
+                binary_overlay=use_instance_segmentation_dataset,
             ),
         )
         # GT-style output: grayscale PNG, pixel value = class id
         save_label = (
             (label_map * 255).astype(np.uint8)
-            if use_custom_seg_dataset
+            if use_instance_segmentation_dataset
             else label_map.astype(np.uint8)
         )
 
@@ -316,7 +316,7 @@ def run(cfg: DictConfig, base_loader=None, trainer=None):
     if data_type == "image":
         if cfg.task == "sem_seg":
             run_images_sem_seg(
-                torch_model, folder_path, output_path, label_to_name=cfg.train.label_to_name, use_custom_seg_dataset=cfg.train.custom_seg_dataset
+                torch_model, folder_path, output_path, label_to_name=cfg.train.label_to_name, use_instance_segmentation_dataset=cfg.train.instance_segmentation_dataset
             )
         else:
             run_images(

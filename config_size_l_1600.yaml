@@ -1,4 +1,4 @@
-project_name: fbm_wall_seg_20260715 # for wandb
+project_name: fbm_wall_seg_20260725 # for wandb
 exp_name: sem_seg_l # experiment name
 
 exp: ${exp_name}_${now_dir}
@@ -11,15 +11,16 @@ train:
   root: /home/tien.nguyen/workspace/project/common/data/yap-3/wall_seg_crop/ # project root with dataset and outputs
   pretrained_dataset: coco # coco, obj2coco
   # detect: dfine_${model_name}_${train.pretrained_dataset}.pt; sem_seg/segment: use dfine_seg_*
-  pretrained_model_path: pretrained/dfine_seg_${model_name}_coco.pt
+  # pretrained_model_path: pretrained/dfine_seg_${model_name}_coco.pt
+  pretrained_model_path: /home/tien.nguyen/workspace/project/D-FINE-seg/experiments/size_l_1600_pretrained_cubicasa/model.pt
 
   imagenet_backbone: False # research: init HGNetv2 from ImageNet stage1 weights
   coco_dataset: False # set True when annotations are in COCO JSON format (train/val/test)
-  custom_seg_dataset: True
+  instance_segmentation_dataset: True
 
   data_path: ${train.root} # path to dataset (images/, labels/, train.csv, val.csv)
   path_to_test_data: ${train.root}/test/images  # path to test set, used in infer script
-  path_to_save: /home/tien.nguyen/workspace/project/D-FINE-seg/experiments/wall_seg_yap_size_l_1600_with_sam3_encoder_and_adapter_new_sem_seg_validator # where to save output
+  path_to_save: /home/tien.nguyen/workspace/project/D-FINE-seg/experiments/wall_seg_yap_size_l_1600_from_cubicasa_ckpt_with_custom_mosaic # where to save output
 
   debug_img_path: /home/tien.nguyen/workspace/project/D-FINE-seg/output/debug_images
   eval_preds_path: /home/tien.nguyen/workspace/project/D-FINE-seg/output/eval_preds
@@ -28,7 +29,7 @@ train:
 
   hgnet_v2_config:
     # "use_sam2_features": True,
-    use_sam3_features: True
+    use_sam3_features: False
     sam_checkpoint_path: "/data1/workspace/ai_shared_workspace/model_zoo_shared/sam3/sam3.pt"
     # "sam_checkpoint_path": "/data1/workspace/ai_shared_workspace/model_zoo_shared/sam2-hiera-large/sam2_hiera_large.pt",
     train_adapter_block: True

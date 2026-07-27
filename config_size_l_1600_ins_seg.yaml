@@ -15,7 +15,7 @@ train:
 
   imagenet_backbone: False # research: init HGNetv2 from ImageNet stage1 weights
   coco_dataset: True # set True when annotations are in COCO JSON format (train/val/test)
-  custom_seg_dataset: False
+  instance_segmentation_dataset: False
 
   data_path: ${train.root} # path to dataset (images/, labels/, train.csv, val.csv)
   path_to_test_data: ${train.root}/test/  # path to test set, used in infer script

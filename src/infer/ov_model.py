@@ -73,7 +73,7 @@ class OV_model:
         inference_mode = "CUMULATIVE_THROUGHPUT" if self.max_batch_size > 1 else "LATENCY"
         self.model = core.compile_model(
             det_ov_model,
-            self.device,
+            device_name="CPU",
             config={"PERFORMANCE_HINT": inference_mode, "INFERENCE_PRECISION_HINT": inference_hint},
         )
         logger.info(f"OpenVino running on {self.device}")
