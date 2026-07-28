@@ -722,7 +722,7 @@ def main(cfg: DictConfig):
             input_name=input_name,
             output_names=output_names if sem_seg else raw_output_names,
         )
-        export_to_openvino(raw_onnx_path, x_test, cfg.export.dynamic_input, max_batch_size=1)
+        export_to_openvino(raw_onnx_path, x_test, cfg.export.dynamic_input, max_batch_size=cfg.export.max_batch_size)
 
     if want("onnx") or want("tensorrt"):
         full_onnx_path = export_to_onnx(

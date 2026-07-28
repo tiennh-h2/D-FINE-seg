@@ -164,7 +164,7 @@ split:
 export: # TensorRT must be done on the inference device
   from_pretrained: False # if True - exports pretrained weights, training is not needed
   half: True # tensorrt, openvino
-  max_batch_size: 1 # torch, tensorrt, openvino
+  max_batch_size: 4 # torch, tensorrt, openvino
   dynamic_input: False # applies to onnx and openvino; the tensorrt engine is always built static
   formats: null # null = build all backends; list (e.g. [tensorrt]) restricts what is built
   parity: True # after export, print cosine / max-abs-diff of each backend vs torch on one input
@@ -189,9 +189,6 @@ infer:
   paddings: # if int - amount of pixes, if float - percentage of image size
     w: 0.05
     h: 0.05
-  slice_inference: True
-  tile_size: 1024
-  tile_overlap: 0.2
 
 
 ### service ###

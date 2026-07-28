@@ -6,7 +6,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -54,6 +54,50 @@ def wandb_logger(loss, metrics: Dict[str, float], epoch, mode: str) -> None:
             log_data[f"{mode}/metrics/{metric_name}"] = metric_value
 
     wandb.log(log_data)
+
+
+def read_image_hwc(path) -> Optional[np.ndarray]:
+    """Load an image as an HWC uint8 array.
+
+    - ``.npy``: ``np.load`` (multi-channel data; project convention is RGB+extras).
+    - everything else: default ``cv2.imread`` (BGR uint8, 3 channels — grayscale
+      replicated, alpha dropped, uint16 quantized). Matches ``_read_image``'s
+      3-channel branch so inference call sites and the training reader share
+      the same source-of-truth.
+
+    Returns ``None`` if the file can't be decoded. Grayscale results from
+    ``.npy`` are promoted to HWC with a trailing axis so callers can rely on
+    ``shape[2]``.
+    """
+    path = Path(path)
+    if path.suffix.lower() == ".npy":
+        try:
+            img = np.load(str(path))
+        except (FileNotFoundError, ValueError, OSError):
+            return None
+        if img.ndim == 2:
+            img = img[..., None]
+        return img
+    return cv2.imread(str(path))
+
+
+def read_image_rgb(path, in_channels: int) -> Optional[np.ndarray]:
+    """Load an image as HWC with channels in RGB(+extras) order.
+
+    Delegates to ``read_image_hwc`` (cv2 default for non-.npy, np.load for
+    .npy) and applies the project conventions on top: cv2 sources need a
+    BGR->RGB swap; ``.npy`` sources are stored RGB(+extras) and need none.
+
+    Returns ``None`` if the file cannot be decoded.
+    Raises ``ValueError`` when the channel count doesn't match in_channels."""
+    image = read_image_hwc(path)
+    if image is None:
+        return None
+    if Path(path).suffix.lower() != ".npy":
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    if image.shape[2] != in_channels:
+        raise ValueError(f"Expected {in_channels} channels at {path}, got {image.shape[2]}")
+    return image
 
 
 def rename_metric_keys(d, label_to_name):
@@ -1667,3 +1711,26 @@ def auto_batch_size(
         f"(target {target_fraction:.0%} of {total_mem / 1024**3:.1f} GB VRAM)"
     )
     return best_bs
+
+
+def axis_slice_starts(
+    length: int,
+    slice_size: int,
+    overlap_ratio: float,
+) -> list[int]:
+    """Return gap-free SAHI-style slice starts for one image axis."""
+    if length <= 0:
+        raise ValueError(f"Image axis length must be positive, got {length}")
+    if slice_size <= 0:
+        raise ValueError(f"SAHI slice size must be positive, got {slice_size}")
+    if not 0.0 <= overlap_ratio < 1.0:
+        raise ValueError(
+            f"SAHI overlap ratio must be in [0, 1), got {overlap_ratio}"
+        )
+
+    max_start = max(length - slice_size, 0)
+    step = max(int(slice_size * (1.0 - overlap_ratio)), 1)
+    starts = list(range(0, max_start + 1, step))
+    if starts[-1] != max_start:
+        starts.append(max_start)
+    return starts

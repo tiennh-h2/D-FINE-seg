@@ -10,13 +10,13 @@ from loguru import logger
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-from src.dl.dataset import read_image_hwc
 from src.dl.utils import (
     Visualizer,
     abs_xyxy_to_norm_xywh,
     get_latest_experiment_name,
     overlay_sem_seg,
     sem_seg_palette,
+    read_image_hwc
 )
 from src.infer.byte_track import ByteTrack, Detection
 from src.infer.torch_model import Torch_model
@@ -240,27 +240,6 @@ def _run_sliced_sem_seg(
             
             tile = image[y1:y2, x1:x2]
             prediction = _to_numpy(torch_model(tile, bgr=bgr)[0]["sem_seg"])
-
-            # debug_tiles_dir = Path("debug_tiles")
-            # debug_tiles_dir.mkdir(parents=True, exist_ok=True)
-
-            # tile = image[y1:y2, x1:x2]
-
-            # # OpenCV expects BGR when saving.
-            # debug_tile = tile[..., :3]
-            # if not bgr:
-            #     debug_tile = cv2.cvtColor(debug_tile, cv2.COLOR_RGB2BGR)
-
-            # debug_path = debug_tiles_dir / (
-            #     f"{Path(img_path).stem}_x{x1}-{x2}_y{y1}-{y2}.png"
-            # )
-
-            # if not cv2.imwrite(str(debug_path), debug_tile):
-            #     logger.warning(f"Failed to save debug tile: {debug_path}")
-
-            # prediction = _to_numpy(
-            #     torch_model(tile, bgr=bgr)[0]["sem_seg"]
-            # )
 
             if prediction.ndim not in (2, 3):
                 raise ValueError(
@@ -643,7 +622,7 @@ def main(cfg: DictConfig):
         rect=cfg.export.dynamic_input,
         channels=cfg.train.in_channels,
         task=cfg.task,
-        return_probs=cfg.infer.slice_inference
+        return_probs=cfg.infer.get("slice_inference") is True
     )
 
     if data_type == "video" and cfg.train.in_channels != 3:

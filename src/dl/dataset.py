@@ -20,6 +20,7 @@ from src.d_fine.dist_utils import is_main_process
 from src.dl.utils import (
     LetterboxRect,
     abs_xyxy_to_norm_xywh,
+    axis_slice_starts,
     clip_polygon_to_rect,
     get_mosaic_coordinate,
     get_transform_matrix,
@@ -28,54 +29,12 @@ from src.dl.utils import (
     overlay_sem_seg,
     poly_abs_to_mask,
     random_affine,
+    read_image_hwc,
+    read_image_rgb,
     seed_worker,
     sem_seg_palette,
     vis_one_box,
 )
-
-
-def read_image_hwc(path) -> Optional[np.ndarray]:
-    """Load an image as an HWC uint8 array.
-
-    - ``.npy``: ``np.load`` (multi-channel data; project convention is RGB+extras).
-    - everything else: default ``cv2.imread`` (BGR uint8, 3 channels — grayscale
-      replicated, alpha dropped, uint16 quantized). Matches ``_read_image``'s
-      3-channel branch so inference call sites and the training reader share
-      the same source-of-truth.
-
-    Returns ``None`` if the file can't be decoded. Grayscale results from
-    ``.npy`` are promoted to HWC with a trailing axis so callers can rely on
-    ``shape[2]``.
-    """
-    path = Path(path)
-    if path.suffix.lower() == ".npy":
-        try:
-            img = np.load(str(path))
-        except (FileNotFoundError, ValueError, OSError):
-            return None
-        if img.ndim == 2:
-            img = img[..., None]
-        return img
-    return cv2.imread(str(path))
-
-
-def read_image_rgb(path, in_channels: int) -> Optional[np.ndarray]:
-    """Load an image as HWC with channels in RGB(+extras) order.
-
-    Delegates to ``read_image_hwc`` (cv2 default for non-.npy, np.load for
-    .npy) and applies the project conventions on top: cv2 sources need a
-    BGR->RGB swap; ``.npy`` sources are stored RGB(+extras) and need none.
-
-    Returns ``None`` if the file cannot be decoded.
-    Raises ``ValueError`` when the channel count doesn't match in_channels."""
-    image = read_image_hwc(path)
-    if image is None:
-        return None
-    if Path(path).suffix.lower() != ".npy":
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    if image.shape[2] != in_channels:
-        raise ValueError(f"Expected {in_channels} channels at {path}, got {image.shape[2]}")
-    return image
 
 
 def parse_yolo_label_file(path: Path):
@@ -860,29 +819,6 @@ class CustomDataset(Dataset):
         return len(self.split)
 
 
-def _axis_slice_starts(
-    length: int,
-    slice_size: int,
-    overlap_ratio: float,
-) -> list[int]:
-    """Return gap-free SAHI-style slice starts for one image axis."""
-    if length <= 0:
-        raise ValueError(f"Image axis length must be positive, got {length}")
-    if slice_size <= 0:
-        raise ValueError(f"SAHI slice size must be positive, got {slice_size}")
-    if not 0.0 <= overlap_ratio < 1.0:
-        raise ValueError(
-            f"SAHI overlap ratio must be in [0, 1), got {overlap_ratio}"
-        )
-
-    max_start = max(length - slice_size, 0)
-    step = max(int(slice_size * (1.0 - overlap_ratio)), 1)
-    starts = list(range(0, max_start + 1, step))
-    if starts[-1] != max_start:
-        starts.append(max_start)
-    return starts
-
-
 def _build_sahi_crop_boxes(
     image_h: int,
     image_w: int,
@@ -892,8 +828,8 @@ def _build_sahi_crop_boxes(
     overlap_w: float,
 ) -> list[tuple[int, int, int, int]]:
     """Build `(x1, y1, x2, y2)` crops covering an image without duplicates."""
-    y_starts = _axis_slice_starts(image_h, slice_h, overlap_h)
-    x_starts = _axis_slice_starts(image_w, slice_w, overlap_w)
+    y_starts = axis_slice_starts(image_h, slice_h, overlap_h)
+    x_starts = axis_slice_starts(image_w, slice_w, overlap_w)
     return [
         (x1, y1, min(x1 + slice_w, image_w), min(y1 + slice_h, image_h))
         for y1 in y_starts
@@ -962,7 +898,7 @@ class SemSegDataset(Dataset):
 
     def _init_sahi(self, cfg) -> None:
         """Build a virtual index containing one entry per SAHI crop."""
-        sahi_cfg = getattr(cfg.train, "sahi", None)
+        sahi_cfg = getattr(cfg.train, "sahi", {})
         self.sahi_enabled = (
             self.mode == "train"
             and sahi_cfg is not None
@@ -974,10 +910,11 @@ class SemSegDataset(Dataset):
             self._sample_index.extend((source_idx, None) for source_idx in range(len(self.split)))
             return
 
-        self.sahi_slice_height = int(sahi_cfg.slice_height)
-        self.sahi_slice_width = int(sahi_cfg.slice_width)
-        self.sahi_overlap_height_ratio = float(sahi_cfg.overlap_height_ratio)
-        self.sahi_overlap_width_ratio = float(sahi_cfg.overlap_width_ratio)
+        self.sahi_slice_height = int(sahi_cfg.get("slice_height", 1600))
+        self.sahi_slice_width = int(sahi_cfg.get("slice_width", 1600))
+        self.sahi_overlap_height_ratio = float(sahi_cfg.get("overlap_height_ratio", 0.2))
+        self.sahi_overlap_width_ratio = float(sahi_cfg.get("overlap_width_ratio", 0.2))
+        self.sahi_keep_original_sample = bool(sahi_cfg.get("keep_original_sample", True))
         if self.sahi_slice_height <= 0 or self.sahi_slice_width <= 0:
             raise ValueError(
                 "SAHI slice size must be positive, got "
@@ -1000,6 +937,8 @@ class SemSegDataset(Dataset):
                 )
             image, mask = loaded
             self._validate_image_mask_dimensions(image, mask, source_idx)
+            if self.sahi_keep_original_sample:
+                self._sample_index.append((source_idx, None))
             crop_boxes = _build_sahi_crop_boxes(
                 image_h=image.shape[0],
                 image_w=image.shape[1],

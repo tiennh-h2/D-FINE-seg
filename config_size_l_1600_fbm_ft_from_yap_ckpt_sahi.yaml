@@ -1,25 +1,27 @@
-project_name: pretrained_cubicasa # for wandb
-exp_name: sem_seg_m # experiment name
+project_name: fbm_wall_seg_20260715 # for wandb
+exp_name: sem_seg_l # experiment name
 
 exp: ${exp_name}_${now_dir}
 
-model_name: m # model size (n, s, m, l, x)
+model_name: l # model size (n, s, m, l, x)
 task: sem_seg # detect | segment (instance segmentation) | sem_seg (semantic segmentation)
 
 train:
   ### Paths ###
-  root: /home/tien.nguyen/workspace/project/common/data/others/cubicasa5k/processed_data/ # project root with dataset and outputs
+  root: /data1/workspace/tien.nguyen/project/common/data/fbm/residential/fbm_wall_seg_20260725/ # project root with dataset and outputs
   pretrained_dataset: coco # coco, obj2coco
   # detect: dfine_${model_name}_${train.pretrained_dataset}.pt; sem_seg/segment: use dfine_seg_*
-  pretrained_model_path: pretrained/dfine_seg_${model_name}_coco.pt
-
+  # pretrained_model_path: pretrained/dfine_seg_${model_name}_coco.pt
+  pretrained_model_path: /data1/workspace/tien.nguyen/project/D-FINE-seg/experiments/wall_seg_yap_size_l_1600_from_cubicasa_ckpt_with_custom_mosaic/model.pt
+  
   imagenet_backbone: False # research: init HGNetv2 from ImageNet stage1 weights
   coco_dataset: False # set True when annotations are in COCO JSON format (train/val/test)
   instance_segmentation_dataset: True
 
   data_path: ${train.root} # path to dataset (images/, labels/, train.csv, val.csv)
   path_to_test_data: ${train.root}/test/images  # path to test set, used in infer script
-  path_to_save: /home/tien.nguyen/workspace/project/D-FINE-seg/experiments/size_m_1600_pretrained_cubicasa # where to save output
+  # path_to_test_data: /data1/workspace/tien.nguyen/project/common/data/fbm/fbm-lakefs/residential/xml/task5433/images/
+  path_to_save: /home/tien.nguyen/workspace/project/D-FINE-seg/experiments/sahi_wall_seg_fbm_size_l_1600_from_yap_ckpt_with_custom_mosaic # where to save output
 
   debug_img_path: /home/tien.nguyen/workspace/project/D-FINE-seg/output/debug_images
   eval_preds_path: /home/tien.nguyen/workspace/project/D-FINE-seg/output/eval_preds
@@ -27,11 +29,27 @@ train:
   infer_path: /home/tien.nguyen/workspace/project/D-FINE-seg/output/infer
 
   hgnet_v2_config:
-    # use_sam2_features: True
+    # use_sam2_features: False
     use_sam3_features: False
-    sam_checkpoint_path: "/data1/workspace/ai_shared_workspace/model_zoo_shared/sam3/sam3.pt"
-    # sam_checkpoint_path: "/data1/workspace/ai_shared_workspace/model_zoo_shared/sam2/sam2_hiera_large.pt"
+    # sam_checkpoint_path: "/data1/workspace/ai_shared_workspace/model_zoo_shared/sam3/sam3.pt"
+    sam_checkpoint_path: "/data1/workspace/ai_shared_workspace/model_zoo_shared/sam2/sam2_hiera_large.pt"
     train_adapter_block: True
+
+  sahi:
+    eval_enabled: True
+    enabled: True
+    slice_height: 2400
+    slice_width: 2400
+    overlap_height_ratio: 0.2
+    overlap_width_ratio: 0.2
+    keep_original_sample: True
+
+  # sem_seg_criterion_config:
+  #   weight_dict: 
+  #     loss_ce: 0
+  #     loss_dice: 1
+  #     loss_aux: 0.4
+  #     loss_structure: 1
 
   ### Configs ###
   use_wandb: False
@@ -44,7 +62,6 @@ train:
 
   # sem_seg only: masks live in <data_path>/labels/<stem>.png, 1 channel, pixel value = class id
   sem_seg:
-    eval_ignore_classes: [0]
     ignore_index: 255 # pixel value excluded from loss + mIoU (also used as aug mask fill)
     class_weights: null # optional per-class CE weights for imbalance
 
@@ -67,7 +84,7 @@ train:
   amp_dtype: bfloat16 # bfloat16/float16
   clip_max_norm: 0.1 # gradient clipping
 
-  batch_size: 4 # physical, should fit on the device. In DDP used per GPU. Auto-pick with -1
+  batch_size: 8 # physical, should fit on the device. In DDP used per GPU. Auto-pick with -1
   b_accum_steps: 1 # grad accumulation (n * bs)
   epochs: 75
   max_walltime_min: null # research: stop training after N minutes (best epoch kept); null = no cap
@@ -101,7 +118,7 @@ train:
   mosaic_augs: # all tasks
     # mosaic_prob: null = task default (0.8 det, 0.5 segment/sem_seg)
     # set a number to override, 0 disables
-    mosaic_prob: null
+    mosaic_prob: 0.6
     no_mosaic_epochs: 5
     mosaic_scale: [0.5, 1.5]
     degrees: 0.0 # not recommended if bbox precision is critical
@@ -136,8 +153,8 @@ train:
       backbone_lr: 0.00006  # can setup up to 0.0002
       base_lr: 0.00025  # 0.0004
     m:
-      backbone_lr: 0.00002  # 0.000025
-      base_lr: 0.00015  # 0.00025
+      backbone_lr: 0.00001  # 0.000025
+      base_lr: 0.00005  # 0.00025
     l:
       backbone_lr: 0.00001 # 0.00000625 - 0.0000125
       base_lr: 0.00016 # 0.000125 - 0.00025
@@ -181,6 +198,9 @@ infer:
   paddings: # if int - amount of pixes, if float - percentage of image size
     w: 0.05
     h: 0.05
+  slice_inference: False
+  tile_size: 2400
+  tile_overlap: 0.2
 
 
 ### service ###

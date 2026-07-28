@@ -26,7 +26,6 @@ class Torch_model:
         labels_to_use: List[int] = None,  # empty -> keep all classes; else keep only these ids
         enable_mask_head: bool = False,
         binarize_masks: bool = True,
-        mask_threshold: float = 0.5,
         device: str = None,
         channels: int = 3,
         task: str = None,  # detect | segment | sem_seg; overrides enable_mask_head
@@ -46,8 +45,8 @@ class Torch_model:
         self.channels = channels
         self.debug_mode = False
         self.binarize_masks = binarize_masks
-        self.mask_threshold = mask_threshold
         self.return_probs = return_probs
+        self.conf_thresh = conf_thresh
 
         if isinstance(conf_thresh, float):
             self.conf_threshs = [conf_thresh] * self.n_outputs
@@ -244,7 +243,7 @@ class Torch_model:
             if self.return_probs:
                 sem_seg = foreground_prob
             else:
-                sem_seg = (foreground_prob > self.mask_threshold).long()
+                sem_seg = (foreground_prob > self.conf_thresh).long()
 
             if labels_to_use:
                 keep = torch.as_tensor(
@@ -341,7 +340,7 @@ class Torch_model:
                 )
                 out["masks"] = masks_list[0]  # [K, H, W]
                 if self.binarize_masks:
-                    out["masks"] = (out["masks"] >= self.mask_threshold).to(torch.uint8)
+                    out["masks"] = (out["masks"] >= self.conf_thresh).to(torch.uint8)
                 # clean up masks outside of the corresponding bbox
                 out["masks"] = cleanup_masks(out["masks"], out["boxes"])
 

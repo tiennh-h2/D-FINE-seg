@@ -39,6 +39,7 @@ from src.d_fine.dist_utils import (
 from src.dl.dataset import Loader
 from src.dl.utils import (
     auto_batch_size,
+    axis_slice_starts,
     calculate_remaining_time,
     cleanup_masks,
     encode_sample_masks_to_rle,
@@ -48,6 +49,7 @@ from src.dl.utils import (
     poly_abs_to_mask,
     process_boxes,
     process_masks,
+    read_image_rgb,
     save_metrics,
     set_seeds,
     visualize,
@@ -498,12 +500,26 @@ class Trainer:
         Pred argmax is upsampled to the original size with NEAREST and compared
         against the original-res GT PNG re-read from labels/ (the batch-level
         resized GT is only used for the loss).
+
+        If cfg.train.sahi.eval_enabled is set, each image is instead evaluated by
+        tiling the ORIGINAL image into overlapping SAHI-style crops (same slice
+        size / overlap ratios as training), running the model on every crop, and
+        averaging per-pixel class probabilities across overlapping tiles before
+        thresholding -- mirrors `_run_sliced_sem_seg` used at inference time.
         """
         model = self.ema_model.model if self.ema_model else self.model
         model.eval()
         validator = SemSegValidator(self.num_labels, self.label_to_name, self.ignore_index)
         labels_dir = Path(self.cfg.train.data_path) / "labels"
         n_vis = 0
+
+        sahi_cfg = getattr(self.cfg.train, "sahi", None)
+        sahi_eval = bool(getattr(sahi_cfg, "eval_enabled", False)) if sahi_cfg is not None else False
+        if sahi_eval:
+            sahi_tile_h = int(sahi_cfg.slice_height)
+            sahi_tile_w = int(sahi_cfg.slice_width)
+            sahi_overlap_h = float(sahi_cfg.overlap_height_ratio)
+            sahi_overlap_w = float(sahi_cfg.overlap_width_ratio)
 
         eval_iter = val_loader
         if self.is_main:
@@ -513,14 +529,15 @@ class Trainer:
             for inputs, targets, img_paths in eval_iter:
                 if inputs is None:
                     continue
-                inputs = inputs.to(self.device)
-                if self.amp_enabled:
-                    with autocast(str(self.device), dtype=self.amp_dtype, cache_enabled=True):
+                if not sahi_eval:
+                    inputs = inputs.to(self.device)
+                    if self.amp_enabled:
+                        with autocast(str(self.device), dtype=self.amp_dtype, cache_enabled=True):
+                            outputs = model(inputs)
+                    else:
                         outputs = model(inputs)
-                else:
-                    outputs = model(inputs)
-                preds = outputs["sem_seg_logits"] # .argmax(1)  # (B, h, w) at input res
-                proc_h, proc_w = preds.shape[1], preds.shape[2]
+                    preds = outputs["sem_seg_logits"]  # .argmax(1)  # (B, h, w) at input res
+                    proc_h, proc_w = preds.shape[1], preds.shape[2]
 
                 for b, img_path in enumerate(img_paths):
                     mask_path = str(img_path).replace("/images/", "/masks/") if self.instance_segmentation_dataset else labels_dir / f"{Path(img_path).stem}.png"
@@ -532,32 +549,47 @@ class Trainer:
                         gt //= 255
                     gt_t = torch.from_numpy(gt).to(self.device)
                     H0, W0 = gt_t.shape
-                    pred = preds[b]  # (h, w) at input res
-                    if (
-                        self.keep_ratio
-                    ):  # crop letterbox pad before resizing to orig (matches wrappers)
-                        gain = min(proc_h / H0, proc_w / W0)
-                        padw = round((proc_w - W0 * gain) / 2 - 0.1)
-                        padh = round((proc_h - H0 * gain) / 2 - 0.1)
-                        pred = pred[
-                            max(padh, 0) : proc_h - max(padh, 0),
-                            max(padw, 0) : proc_w - max(padw, 0),
-                        ]
-                    pred_probs = torch.softmax(pred, dim=0)      # (C, h', w')
 
-                    pred_probs = F.interpolate(
-                        pred_probs.unsqueeze(0),                 # -> (1, C, h', w')
-                        size=gt_t.shape,                         # (H0, W0)
-                        mode="bilinear",
-                        align_corners=False,
-                    )[0]                                          # -> (C, H0, W0)
+                    if sahi_eval:
+                        pred_full = self._sahi_predict_full_res(
+                            model=model,
+                            img_path=img_path,
+                            image_h=H0,
+                            image_w=W0,
+                            tile_h=sahi_tile_h,
+                            tile_w=sahi_tile_w,
+                            overlap_h=sahi_overlap_h,
+                            overlap_w=sahi_overlap_w,
+                            conf_thresh=conf_thresh,
+                        )
+                    else:
+                        pred = preds[b]  # (h, w) at input res
+                        if (
+                            self.keep_ratio
+                        ):  # crop letterbox pad before resizing to orig (matches wrappers)
+                            gain = min(proc_h / H0, proc_w / W0)
+                            padw = round((proc_w - W0 * gain) / 2 - 0.1)
+                            padh = round((proc_h - H0 * gain) / 2 - 0.1)
+                            pred = pred[
+                                max(padh, 0) : proc_h - max(padh, 0),
+                                max(padw, 0) : proc_w - max(padw, 0),
+                            ]
+                        pred_probs = torch.softmax(pred, dim=0)      # (C, h', w')
 
-                    max_probs, pred_full = pred_probs.max(dim=0)
-                    pred_full = torch.where(
-                        max_probs > conf_thresh,
-                        pred_full,
-                        torch.zeros_like(pred_full),  # use background class 0
-                    )
+                        pred_probs = F.interpolate(
+                            pred_probs.unsqueeze(0),                 # -> (1, C, h', w')
+                            size=gt_t.shape,                         # (H0, W0)
+                            mode="bilinear",
+                            align_corners=False,
+                        )[0]                                          # -> (C, H0, W0)
+
+                        max_probs, pred_full = pred_probs.max(dim=0)
+                        pred_full = torch.where(
+                            max_probs > conf_thresh,
+                            pred_full,
+                            torch.zeros_like(pred_full),  # use background class 0
+                        )
+
                     validator.update(pred_full, gt_t)
 
                     if self.is_main and self.to_visualize_eval and n_vis < 20:
@@ -584,6 +616,81 @@ class Trainer:
             if path_to_save:
                 validator.save_plots(path_to_save / "plots" / mode)
         return metrics
+
+
+    @torch.no_grad()
+    def _sahi_predict_full_res(
+        self,
+        model,
+        img_path,
+        image_h: int,
+        image_w: int,
+        tile_h: int,
+        tile_w: int,
+        overlap_h: float,
+        overlap_w: float,
+        conf_thresh: float,
+    ) -> torch.Tensor:
+        """Tile the ORIGINAL image into overlapping SAHI crops, run `model` on each
+        crop, and average per-pixel class probabilities across overlaps -- same
+        scheme as `_run_sliced_sem_seg`, but returning a thresholded (H, W) class
+        map on `self.device` instead of a numpy argmax, so it plugs straight into
+        `validator.update`.
+        """
+        image = read_image_rgb(Path(img_path), self.cfg.train.in_channels)
+        if image.shape[:2] != (image_h, image_w):
+            raise ValueError(
+                f"Loaded image size {image.shape[:2]} doesn't match GT size {(image_h, image_w)} "
+                f"for {img_path}"
+            )
+
+        y_starts = axis_slice_starts(image_h, tile_h, overlap_h)
+        x_starts = axis_slice_starts(image_w, tile_w, overlap_w)
+
+        score_sum = torch.zeros(
+            (self.num_labels, image_h, image_w), dtype=torch.float32, device=self.device
+        )
+        score_count = torch.zeros((image_h, image_w), dtype=torch.float32, device=self.device)
+
+        target_h, target_w = self.cfg.train.img_size
+        
+        for y1 in y_starts:
+            y2 = min(y1 + tile_h, image_h)
+            for x1 in x_starts:
+                x2 = min(x1 + tile_w, image_w)
+                tile = image[y1:y2, x1:x2]
+                tile_resized = cv2.resize(tile, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                tile_t = (
+                    torch.from_numpy(tile_resized.astype(np.float32) / 255.0)
+                    .permute(2, 0, 1)
+                    .unsqueeze(0)
+                    .to(self.device)
+                )
+                if self.amp_enabled:
+                    with autocast(str(self.device), dtype=self.amp_dtype, cache_enabled=True):
+                        tile_outputs = model(tile_t)
+                else:
+                    tile_outputs = model(tile_t)
+                tile_logits = tile_outputs["sem_seg_logits"][0]  # (C, th, tw) at tile res
+                if tile_logits.shape[-2:] != (y2 - y1, x2 - x1):
+                    # model changed the tile's spatial size (e.g. internal resize) -> align back
+                    tile_logits = F.interpolate(
+                        tile_logits.unsqueeze(0),
+                        size=(y2 - y1, x2 - x1),
+                        mode="bilinear",
+                        align_corners=False,
+                    )[0]
+                score_sum[:, y1:y2, x1:x2] += torch.softmax(tile_logits, dim=0)
+                score_count[y1:y2, x1:x2] += 1.0
+
+        avg_probs = score_sum / score_count.clamp(min=1.0)
+        max_probs, pred_full = avg_probs.max(dim=0)
+        pred_full = torch.where(
+            max_probs > conf_thresh,
+            pred_full,
+            torch.zeros_like(pred_full),  # use background class 0
+        )
+        return pred_full
 
     def evaluate(
         self,
@@ -877,7 +984,7 @@ class Trainer:
                         ),
                         vram=f"{get_vram_usage()}%",
                     )
-                
+
             # Final update for leftover grads from an incomplete accumulation step.
             # has_grads guards an all-None trailing window (grads None post zero_grad).
             has_grads = any(p.grad is not None for p in self.model.parameters())
